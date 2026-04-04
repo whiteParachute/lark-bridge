@@ -1,0 +1,18 @@
+{
+  "feishu": {
+    "appId": "cli_your_app_id",
+    "appSecret": "your_app_secret"
+  },
+  "claude": {
+    "model": "sonnet",
+    "workspaceRoot": "~/workspace/feishu-bridge",
+    "additionalDirectories": []
+  },
+  "session": {
+    "idleTimeoutMs": 1800000,
+    "maxDurationMs": 14400000
+  },
+  "log": {
+    "level": "info"
+  }
+}

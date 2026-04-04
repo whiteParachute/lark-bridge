@@ -1,0 +1,10 @@
+{
+  "name": "feishu-bridge",
+  "version": "0.1.0",
+  "description": "Bridge Feishu (飞书) conversations to Claude Code sessions with aria-memory integration, session lifecycle management, and streaming card output.",
+  "author": {
+    "name": "whiteParachute"
+  },
+  "license": "MIT",
+  "keywords": ["feishu", "lark", "bridge", "chat", "im"]
+}
