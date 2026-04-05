@@ -96,7 +96,7 @@ function buildCard(
   }
 
   return {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       title: { tag: 'plain_text', content: title },
       template: headerTemplate[state],

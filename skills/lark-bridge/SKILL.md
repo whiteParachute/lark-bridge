@@ -1,5 +1,5 @@
 ---
-name: feishu-bridge
+name: lark-bridge
 description: |
   Manage the Feishu Bridge daemon. Start, stop, or check status of the
   background service that bridges Feishu chat to Claude Code sessions.
@@ -31,4 +31,4 @@ bash ${CLAUDE_PLUGIN_ROOT}/scripts/status.sh
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/stop.sh && sleep 1 && bash ${CLAUDE_PLUGIN_ROOT}/scripts/start.sh
 ```
 
-Report the result to the user. If the config file `~/.feishu-bridge/config.json` doesn't exist, suggest running `/feishu-setup` first.
+Report the result to the user. If the config file `~/.lark-bridge/config.json` doesn't exist, suggest running `/feishu-setup` first.

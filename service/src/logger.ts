@@ -1,9 +1,12 @@
 import pino from 'pino';
 
-export const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  transport:
-    process.stdout.isTTY
-      ? { target: 'pino-pretty', options: { colorize: true } }
-      : undefined,
-});
+/** Log level can be set via config or env. Call initLogger() after config is loaded. */
+let _logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+
+export function initLogger(level: string): void {
+  _logger = pino({
+    level: process.env.LOG_LEVEL || level || 'info',
+  });
+}
+
+export { _logger as logger };

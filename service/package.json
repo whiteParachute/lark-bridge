@@ -1,5 +1,5 @@
 {
-  "name": "feishu-bridge-service",
+  "name": "lark-bridge-service",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,6 +12,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.2.77",
     "@larksuiteoapi/node-sdk": "^1.58.0",
     "pino": "^9.0.0",
+    "pino-pretty": "^13.0.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {

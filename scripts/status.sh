@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-BRIDGE_DIR="$HOME/.feishu-bridge"
+BRIDGE_DIR="$HOME/.lark-bridge"
 PID_FILE="$BRIDGE_DIR/bridge.pid"
 STATUS_FILE="$BRIDGE_DIR/status.json"
 LOG_FILE="$BRIDGE_DIR/bridge.log"
 
-echo "=== feishu-bridge status ==="
+echo "=== lark-bridge status ==="
 
 # Check daemon
 RUNNING=false
