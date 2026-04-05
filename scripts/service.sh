@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SERVICE_DIR="$SCRIPT_DIR/../service"
+SERVICE_DIR="$(cd "$SCRIPT_DIR/../service" && pwd)"
 BRIDGE_DIR="$HOME/.lark-bridge"
 CONFIG_FILE="${LARK_BRIDGE_CONFIG:-$BRIDGE_DIR/config.json}"
 LOG_FILE="$BRIDGE_DIR/bridge.log"
