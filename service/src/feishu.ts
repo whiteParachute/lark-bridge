@@ -148,8 +148,17 @@ export class FeishuClient {
   }
 
   async disconnect(): Promise<void> {
-    // WSClient doesn't expose a clean stop method — just let it die with the process
-    this.wsClient = null;
+    if (this.wsClient) {
+      try {
+        // WSClient may not expose stop() in all SDK versions — best effort
+        const ws = this.wsClient as any;
+        if (typeof ws.stop === 'function') await ws.stop();
+        else if (typeof ws.close === 'function') await ws.close();
+      } catch {
+        // Best effort
+      }
+      this.wsClient = null;
+    }
   }
 
   /**

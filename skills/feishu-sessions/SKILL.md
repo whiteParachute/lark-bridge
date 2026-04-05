@@ -10,7 +10,7 @@ allowed-tools: [Bash, Read]
 Read and display the Feishu Bridge session status:
 
 ```bash
-cat ~/.feishu-bridge/status.json 2>/dev/null || echo '{"error": "Bridge not running or no status file"}'
+cat ~/.lark-bridge/status.json 2>/dev/null || echo '{"error": "Bridge not running or no status file"}'
 ```
 
 Format the output as a readable table showing:
@@ -21,4 +21,4 @@ Format the output as a readable table showing:
 - State (active/closing)
 - Last activity (relative time)
 
-If no sessions are active, say so. If the bridge isn't running, suggest `/feishu-bridge start`.
+If no sessions are active, say so. If the bridge isn't running, suggest `/lark-bridge start`.

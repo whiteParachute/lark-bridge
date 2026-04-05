@@ -2,16 +2,14 @@
  * Claude Agent SDK wrapper.
  *
  * Adapted from HappyClaw's claude-session.ts — simplified for single-user
- * bridge use. No MCP servers, no custom hooks, no predefined agents.
- * Relies on settingSources: ['project', 'user'] to load all plugins
- * (including aria-memory) automatically.
+ * bridge use. Relies on settingSources: ['project', 'user'] to load all
+ * plugins (including aria-memory) automatically.
  */
 
 import {
   query,
   type Query,
   type SDKUserMessage,
-  type SDKMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { logger } from './logger.js';
 
@@ -40,7 +38,6 @@ class MessageStream {
     }
 
     let content: any;
-
     if (images && images.length > 0) {
       content = [
         { type: 'text', text },
@@ -85,6 +82,25 @@ class MessageStream {
   }
 }
 
+// ─── Stream Message Types ────────────────────────────────────
+
+export interface StreamMessage {
+  type:
+    | 'text_delta'
+    | 'thinking_delta'
+    | 'tool_use_start'
+    | 'tool_use_end'
+    | 'turn_complete'
+    | 'session_init'
+    | 'error';
+  text?: string;
+  sessionId?: string;
+  error?: string;
+  toolName?: string;
+  toolUseId?: string;
+  isError?: boolean;
+}
+
 // ─── Claude Bridge ───────────────────────────────────────────
 
 export interface ClaudeBridgeOptions {
@@ -92,13 +108,7 @@ export interface ClaudeBridgeOptions {
   cwd: string;
   additionalDirectories?: string[];
   sessionId?: string;
-}
-
-export interface StreamMessage {
-  type: 'text_delta' | 'turn_complete' | 'session_init' | 'error';
-  text?: string;
-  sessionId?: string;
-  error?: string;
+  permissionMode?: string;
 }
 
 export class ClaudeBridge {
@@ -106,19 +116,17 @@ export class ClaudeBridge {
   private queryRef: Query | null = null;
   private outputLoop: Promise<void> | null = null;
   private accumulatedText = '';
-  private onMessage: ((msg: StreamMessage) => void) | null = null;
+  private accumulatedThinking = '';
+  private activeToolBlocks = new Map<number, string>(); // index → toolName
 
-  /**
-   * Start the Claude session and begin consuming output.
-   * Call onMessage for each streaming event.
-   */
   start(
     opts: ClaudeBridgeOptions,
     onMessage: (msg: StreamMessage) => void,
   ): void {
     this.stream = new MessageStream();
-    this.onMessage = onMessage;
     this.accumulatedText = '';
+    this.accumulatedThinking = '';
+    this.activeToolBlocks.clear();
 
     const stream = this.stream;
     const self = this;
@@ -132,8 +140,10 @@ export class ClaudeBridge {
             cwd: opts.cwd,
             additionalDirectories: opts.additionalDirectories,
             ...(opts.sessionId ? { resume: opts.sessionId } : {}),
-            permissionMode: 'bypassPermissions' as const,
-            allowDangerouslySkipPermissions: true,
+            permissionMode: (opts.permissionMode || 'plan') as any,
+            ...(opts.permissionMode === 'bypassPermissions'
+              ? { allowDangerouslySkipPermissions: true }
+              : {}),
             settingSources: ['project', 'user'],
             includePartialMessages: true,
           },
@@ -153,14 +163,20 @@ export class ClaudeBridge {
     })();
   }
 
-  private processMessage(message: any, onMessage: (msg: StreamMessage) => void): void {
+  private processMessage(
+    message: any,
+    onMessage: (msg: StreamMessage) => void,
+  ): void {
     if (message.type === 'system' && message.subtype === 'init') {
       onMessage({
         type: 'session_init',
         sessionId: message.session_id,
       });
-    } else if (message.type === 'assistant') {
-      // Extract text from complete assistant message
+      return;
+    }
+
+    if (message.type === 'assistant') {
+      // Complete assistant message — extract final text
       const content = message.message?.content;
       if (Array.isArray(content)) {
         for (const block of content) {
@@ -169,37 +185,91 @@ export class ClaudeBridge {
           }
         }
       }
-    } else if (message.type === 'stream_event') {
-      // BetaRawMessageStreamEvent — check for content_block_delta with text_delta
+      return;
+    }
+
+    if (message.type === 'stream_event') {
       const event = message.event;
       if (!event) return;
 
-      // The Anthropic SDK uses event.type like 'content_block_delta'
-      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+      // Thinking
+      if (
+        event.type === 'content_block_delta' &&
+        event.delta?.type === 'thinking_delta'
+      ) {
+        this.accumulatedThinking += event.delta.text || '';
+        onMessage({
+          type: 'thinking_delta',
+          text: this.accumulatedThinking,
+        });
+        return;
+      }
+
+      // Text output
+      if (
+        event.type === 'content_block_delta' &&
+        event.delta?.type === 'text_delta'
+      ) {
         this.accumulatedText += event.delta.text || '';
+        this.accumulatedThinking = ''; // Clear thinking when text starts
         onMessage({
           type: 'text_delta',
           text: this.accumulatedText,
         });
+        return;
       }
-    } else if (message.type === 'result') {
-      // SDKResultSuccess has .result, SDKResultError does not
-      const finalText =
-        ('result' in message ? message.result : null) ||
-        this.accumulatedText ||
-        '(no response)';
+
+      // Tool use start
+      if (event.type === 'content_block_start') {
+        const block = event.content_block;
+        if (block?.type === 'tool_use') {
+          this.activeToolBlocks.set(event.index, block.name);
+          onMessage({
+            type: 'tool_use_start',
+            toolName: block.name,
+            toolUseId: block.id,
+          });
+        }
+        return;
+      }
+
+      // Tool use end (content_block_stop)
+      if (event.type === 'content_block_stop') {
+        const toolName = this.activeToolBlocks.get(event.index);
+        if (toolName) {
+          this.activeToolBlocks.delete(event.index);
+          onMessage({
+            type: 'tool_use_end',
+            toolName,
+          });
+        }
+        return;
+      }
+
+      return;
+    }
+
+    if (message.type === 'result') {
+      const isSuccess = message.subtype === 'success';
+      const finalText = isSuccess
+        ? message.result || this.accumulatedText || ''
+        : this.accumulatedText || '';
+      const errorMsg = !isSuccess ? message.stop_reason || 'execution error' : undefined;
+
       onMessage({
         type: 'turn_complete',
         text: finalText,
+        isError: !isSuccess,
+        error: errorMsg,
       });
+
       // Reset for next turn
       this.accumulatedText = '';
+      this.accumulatedThinking = '';
+      this.activeToolBlocks.clear();
     }
   }
 
-  /**
-   * Push a user message into the active session.
-   */
   pushMessage(
     text: string,
     images?: Array<{ data: string; mimeType: string }>,
@@ -209,7 +279,11 @@ export class ClaudeBridge {
   }
 
   async interrupt(): Promise<void> {
-    await this.queryRef?.interrupt();
+    try {
+      await this.queryRef?.interrupt();
+    } catch {
+      // Best effort
+    }
   }
 
   end(): void {
@@ -218,9 +292,5 @@ export class ClaudeBridge {
 
   async waitForCompletion(): Promise<void> {
     await this.outputLoop;
-  }
-
-  getAccumulatedText(): string {
-    return this.accumulatedText;
   }
 }

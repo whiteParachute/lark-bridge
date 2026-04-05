@@ -1,9 +1,9 @@
 #!/bin/bash
-# SessionStart hook: report feishu-bridge daemon status
+# SessionStart hook: report lark-bridge daemon status
 
 set -euo pipefail
 
-BRIDGE_DIR="$HOME/.feishu-bridge"
+BRIDGE_DIR="$HOME/.lark-bridge"
 PID_FILE="$BRIDGE_DIR/bridge.pid"
 STATUS_FILE="$BRIDGE_DIR/status.json"
 
@@ -28,5 +28,5 @@ fi
 
 # Output context
 cat << EOF
-{"hookSpecificOutput":{"additionalContext":"## Feishu Bridge\n\nfeishu-bridge daemon is running (PID: $(cat "$PID_FILE")). Active sessions: ${SESSIONS}.\nUse /feishu-bridge status for details, /feishu-sessions to list active conversations."}}
+{"hookSpecificOutput":{"additionalContext":"## Feishu Bridge\n\nlark-bridge daemon is running (PID: $(cat "$PID_FILE")). Active sessions: ${SESSIONS}.\nUse /lark-bridge status for details, /feishu-sessions to list active conversations."}}
 EOF

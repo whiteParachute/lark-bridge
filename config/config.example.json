@@ -1,16 +1,35 @@
 {
   "feishu": {
     "appId": "cli_your_app_id",
-    "appSecret": "your_app_secret"
+    "appSecret": "your_app_secret",
+    "allowedSenders": ["ou_your_open_id"],
+    "allowedChats": []
   },
   "claude": {
     "model": "sonnet",
-    "workspaceRoot": "~/workspace/feishu-bridge",
-    "additionalDirectories": []
+    "workspaceRoot": "~/workspace/lark-bridge",
+    "additionalDirectories": [],
+    "permissionMode": "plan"
   },
   "session": {
     "idleTimeoutMs": 1800000,
     "maxDurationMs": 14400000
+  },
+  "daemon": {
+    "mode": "nohup",
+    "autoStart": false
+  },
+  "hooks": {
+    "session": {
+      "pre": [],
+      "post": [
+        { "type": "aria-memory-wrapup" }
+      ]
+    },
+    "message": {
+      "pre": [],
+      "post": []
+    }
   },
   "log": {
     "level": "info"

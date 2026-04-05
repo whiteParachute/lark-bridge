@@ -19,13 +19,13 @@ Help the user configure the Feishu Bridge service.
    - `claude.model` — Claude model to use (default: `sonnet`)
    - `session.idleTimeoutMs` — idle timeout in ms (default: `1800000` = 30 min)
 
-3. Write the config to `~/.feishu-bridge/config.json`:
+3. Write the config to `~/.lark-bridge/config.json`:
 ```json
 {
   "feishu": { "appId": "...", "appSecret": "..." },
   "claude": {
     "model": "sonnet",
-    "workspaceRoot": "~/workspace/feishu-bridge"
+    "workspaceRoot": "~/workspace/lark-bridge"
   },
   "session": {
     "idleTimeoutMs": 1800000,
@@ -40,4 +40,4 @@ Help the user configure the Feishu Bridge service.
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/install.sh
 ```
 
-5. Tell the user they can now start the bridge with `/feishu-bridge start`.
+5. Tell the user they can now start the bridge with `/lark-bridge start`.

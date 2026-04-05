@@ -1,11 +1,11 @@
 /**
- * feishu-bridge — Bridge Feishu conversations to Claude Code sessions.
+ * lark-bridge — Bridge Feishu conversations to Claude Code sessions.
  *
  * Entry point: loads config, starts Feishu WebSocket, initializes session
  * manager, and wires up signal handlers for graceful shutdown.
  */
 import { loadConfig } from './config.js';
-import { logger } from './logger.js';
+import { logger, initLogger } from './logger.js';
 import { FeishuClient } from './feishu.js';
 import { SessionManager } from './session-manager.js';
 import { mkdirSync, existsSync } from 'node:fs';
@@ -13,10 +13,11 @@ import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 
 async function main(): Promise<void> {
-  logger.info('feishu-bridge starting...');
+  logger.info('lark-bridge starting...');
 
   // Load config
   const config = loadConfig();
+  initLogger(config.log.level);
   logger.info(
     {
       model: config.claude.model,
@@ -27,7 +28,7 @@ async function main(): Promise<void> {
   );
 
   // Ensure directories exist
-  const bridgeDir = resolve(homedir(), '.feishu-bridge');
+  const bridgeDir = resolve(homedir(), '.lark-bridge');
   if (!existsSync(bridgeDir)) mkdirSync(bridgeDir, { recursive: true });
   if (!existsSync(config.claude.workspaceRoot)) {
     mkdirSync(config.claude.workspaceRoot, { recursive: true });
@@ -51,7 +52,7 @@ async function main(): Promise<void> {
 
   // Connect to Feishu
   await feishu.connect();
-  logger.info('feishu-bridge ready. Listening for messages...');
+  logger.info('lark-bridge ready. Listening for messages...');
 
   // Graceful shutdown
   let shuttingDown = false;
@@ -67,7 +68,7 @@ async function main(): Promise<void> {
       logger.error({ err }, 'Error during shutdown');
     }
 
-    logger.info('feishu-bridge stopped.');
+    logger.info('lark-bridge stopped.');
     process.exit(0);
   };
 
@@ -79,6 +80,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  logger.fatal({ err }, 'feishu-bridge fatal error');
+  logger.fatal({ err }, 'lark-bridge fatal error');
   process.exit(1);
 });
