@@ -63,6 +63,14 @@ export class SessionManager {
     this.writeStatus();
   }
 
+  /** Returns true if there are any active or starting sessions. */
+  hasActiveSessions(): boolean {
+    for (const s of this.sessions.values()) {
+      if (s.state === 'starting' || s.state === 'active') return true;
+    }
+    return false;
+  }
+
   async handleMessage(msg: FeishuMessage): Promise<void> {
     // ── Security: allowlist check ──
     if (!this.isAllowed(msg)) {

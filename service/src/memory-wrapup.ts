@@ -5,12 +5,12 @@
  * in aria-memory's meta.json. The actual processing happens when
  * aria-memory's SessionStart hook detects the pending wrapup.
  */
-import { writeFile, readFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
+import { resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { tmpdir } from 'node:os';
 import { logger } from './logger.js';
+import { ARIA_MEMORY_DIR, withMetaLock } from './meta-lock.js';
 
 export interface TranscriptEntry {
   role: 'user' | 'assistant';
@@ -19,10 +19,7 @@ export interface TranscriptEntry {
   imageCount?: number;
 }
 
-const ARIA_MEMORY_DIR = resolve(homedir(), '.aria-memory');
-
-// Simple mutex to serialize meta.json writes (Fix #7: concurrent write race)
-let metaLock: Promise<void> = Promise.resolve();
+// ARIA_MEMORY_DIR and metaLock now live in meta-lock.ts (shared with memory-sleep.ts)
 
 /**
  * Export a session transcript and register it as a pending wrapup.
@@ -72,45 +69,24 @@ export async function exportAndRegisterWrapup(
     await writeFile(transcriptPath, lines.join('\n'), 'utf-8');
     logger.info({ transcriptPath }, 'Transcript exported');
 
-    // 3. Register as pending wrapup in meta.json (serialized via mutex)
-    const metaPath = resolve(ARIA_MEMORY_DIR, 'meta.json');
-    if (!existsSync(metaPath)) {
-      logger.warn('meta.json not found, skipping pending wrapup registration');
-      return;
-    }
+    // 3. Register as pending wrapup in meta.json (serialized via shared mutex)
+    await withMetaLock((meta) => {
+      const pending: any[] = meta.pendingWrapups as any[] || [];
 
-    // Serialize meta.json access to prevent concurrent write corruption
-    metaLock = metaLock.then(async () => {
-      try {
-        const meta = JSON.parse(await readFile(metaPath, 'utf-8'));
-        const pending: any[] = meta.pendingWrapups || [];
+      if (!pending.some((p: any) => p.transcriptPath === transcriptPath)) {
+        pending.push({
+          transcriptPath,
+          recordedAt: new Date().toISOString(),
+          trigger: 'lark_bridge_session_end',
+        });
+        meta.pendingWrapups = pending;
 
-        if (!pending.some((p: any) => p.transcriptPath === transcriptPath)) {
-          pending.push({
-            transcriptPath,
-            recordedAt: new Date().toISOString(),
-            trigger: 'lark_bridge_session_end',
-          });
-          meta.pendingWrapups = pending;
-
-          const tmpPath = resolve(
-            dirname(metaPath),
-            `.meta.json.tmp.${Date.now()}`,
-          );
-          await writeFile(tmpPath, JSON.stringify(meta, null, 2), 'utf-8');
-          const { rename } = await import('node:fs/promises');
-          await rename(tmpPath, metaPath);
-
-          logger.info(
-            { transcriptPath, pendingCount: pending.length },
-            'Registered pending wrapup in aria-memory',
-          );
-        }
-      } catch (err) {
-        logger.error({ err }, 'Failed to register pending wrapup');
+        logger.info(
+          { transcriptPath, pendingCount: pending.length },
+          'Registered pending wrapup in aria-memory',
+        );
       }
     });
-    await metaLock;
   } catch (err) {
     logger.error({ err, chatId }, 'Failed to export transcript / register wrapup');
   }

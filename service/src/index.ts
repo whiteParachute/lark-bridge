@@ -8,6 +8,7 @@ import { loadConfig } from './config.js';
 import { logger, initLogger } from './logger.js';
 import { FeishuClient } from './feishu.js';
 import { SessionManager } from './session-manager.js';
+import { GlobalSleepScheduler } from './memory-sleep.js';
 import { mkdirSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -50,6 +51,19 @@ async function main(): Promise<void> {
   // Initialize session manager
   sessionManager = new SessionManager(config, feishu);
 
+  // Start global_sleep scheduler
+  let sleepScheduler: GlobalSleepScheduler | null = null;
+  if (config.globalSleep.enabled) {
+    sleepScheduler = new GlobalSleepScheduler(
+      {
+        checkIntervalMs: config.globalSleep.checkIntervalMs,
+        cooldownMs: config.globalSleep.cooldownMs,
+      },
+      () => sessionManager.hasActiveSessions(),
+    );
+    sleepScheduler.start();
+  }
+
   // Connect to Feishu
   await feishu.connect();
   logger.info('lark-bridge ready. Listening for messages...');
@@ -62,6 +76,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'Shutting down...');
 
     try {
+      sleepScheduler?.stop();
       await sessionManager.closeAll('服务维护中，会话已关闭。');
       await feishu.disconnect();
     } catch (err) {
