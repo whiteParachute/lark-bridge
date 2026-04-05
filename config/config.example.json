@@ -9,6 +9,7 @@
     "model": "sonnet",
     "workspaceRoot": "~/workspace/lark-bridge",
     "additionalDirectories": [],
+    "allowAllDirectories": false,
     "permissionMode": "plan"
   },
   "session": {
