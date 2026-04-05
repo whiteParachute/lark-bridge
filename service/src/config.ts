@@ -100,7 +100,7 @@ export function loadConfig(): BridgeConfig {
 
   if (!existsSync(configPath)) {
     throw new Error(
-      `Config file not found: ${configPath}\nRun /feishu-setup to create it.`,
+      `Config file not found: ${configPath}\nRun /lark-setup to create it.`,
     );
   }
 

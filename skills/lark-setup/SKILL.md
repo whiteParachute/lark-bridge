@@ -1,5 +1,5 @@
 ---
-name: feishu-setup
+name: lark-setup
 description: |
   Interactive setup wizard for lark-bridge. Guides through Feishu app credentials,
   Claude model selection, session settings, daemon mode, and hook configuration.
@@ -129,7 +129,7 @@ Then tell the user:
 - Configuration saved to `~/.lark-bridge/config.json`
 - To start the daemon: `/lark-bridge start`
 - To check status: `/lark-bridge status`
-- To reconfigure later: `/feishu-setup reconfigure`
+- To reconfigure later: `/lark-setup reconfigure`
 
 If daemon mode is `service`, remind them to run:
 ```bash

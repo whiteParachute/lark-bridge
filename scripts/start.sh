@@ -15,7 +15,7 @@ CONFIG_FILE="$BRIDGE_DIR/config.json"
 # Check config exists
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "ERROR: Config file not found at $CONFIG_FILE"
-  echo "Run /feishu-setup to configure the bridge first."
+  echo "Run /lark-setup to configure the bridge first."
   exit 1
 fi
 
