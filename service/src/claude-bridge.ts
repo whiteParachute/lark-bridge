@@ -99,6 +99,7 @@ export interface StreamMessage {
   toolName?: string;
   toolUseId?: string;
   isError?: boolean;
+  turnId?: number;
 }
 
 // ─── Claude Bridge ───────────────────────────────────────────
@@ -118,6 +119,7 @@ export class ClaudeBridge {
   private accumulatedText = '';
   private accumulatedThinking = '';
   private activeToolBlocks = new Map<number, string>(); // index → toolName
+  private currentTurnId = 0;
 
   start(
     opts: ClaudeBridgeOptions,
@@ -127,6 +129,7 @@ export class ClaudeBridge {
     this.accumulatedText = '';
     this.accumulatedThinking = '';
     this.activeToolBlocks.clear();
+    this.currentTurnId = 0;
 
     const stream = this.stream;
     const self = this;
@@ -167,6 +170,10 @@ export class ClaudeBridge {
     message: any,
     onMessage: (msg: StreamMessage) => void,
   ): void {
+    // Stamp turnId on all emitted messages
+    const turnId = this.currentTurnId;
+    const emit = (msg: StreamMessage) => onMessage({ ...msg, turnId });
+
     if (message.type === 'system' && message.subtype === 'init') {
       onMessage({
         type: 'session_init',
@@ -198,7 +205,7 @@ export class ClaudeBridge {
         event.delta?.type === 'thinking_delta'
       ) {
         this.accumulatedThinking += event.delta.text || '';
-        onMessage({
+        emit({
           type: 'thinking_delta',
           text: this.accumulatedThinking,
         });
@@ -212,7 +219,7 @@ export class ClaudeBridge {
       ) {
         this.accumulatedText += event.delta.text || '';
         this.accumulatedThinking = ''; // Clear thinking when text starts
-        onMessage({
+        emit({
           type: 'text_delta',
           text: this.accumulatedText,
         });
@@ -224,7 +231,7 @@ export class ClaudeBridge {
         const block = event.content_block;
         if (block?.type === 'tool_use') {
           this.activeToolBlocks.set(event.index, block.name);
-          onMessage({
+          emit({
             type: 'tool_use_start',
             toolName: block.name,
             toolUseId: block.id,
@@ -238,7 +245,7 @@ export class ClaudeBridge {
         const toolName = this.activeToolBlocks.get(event.index);
         if (toolName) {
           this.activeToolBlocks.delete(event.index);
-          onMessage({
+          emit({
             type: 'tool_use_end',
             toolName,
           });
@@ -256,7 +263,7 @@ export class ClaudeBridge {
         : this.accumulatedText || '';
       const errorMsg = !isSuccess ? message.stop_reason || 'execution error' : undefined;
 
-      onMessage({
+      emit({
         type: 'turn_complete',
         text: finalText,
         isError: !isSuccess,
@@ -267,6 +274,7 @@ export class ClaudeBridge {
       this.accumulatedText = '';
       this.accumulatedThinking = '';
       this.activeToolBlocks.clear();
+      this.currentTurnId++;
     }
   }
 
@@ -276,6 +284,10 @@ export class ClaudeBridge {
   ): void {
     if (!this.stream) throw new Error('ClaudeBridge not started');
     this.stream.push(text, images);
+  }
+
+  getTurnId(): number {
+    return this.currentTurnId;
   }
 
   async interrupt(): Promise<void> {

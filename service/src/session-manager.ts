@@ -11,7 +11,7 @@
  * - NEW: Progress card for reasoning/tool progress (deleted after 15s)
  */
 import { mkdirSync, existsSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { ClaudeBridge, type StreamMessage } from './claude-bridge.js';
 import { StreamingCardController } from './streaming-card.js';
@@ -41,14 +41,14 @@ interface Session {
   idleTimer: ReturnType<typeof setTimeout> | null;
   maxDurationTimer: ReturnType<typeof setTimeout> | null;
   messageQueue: FeishuMessage[];
-  turnId: number; // Tracks which turn the streaming card belongs to
-  currentTurnId: number; // Monotonically increasing turn counter
+  turnId: number; // Bridge turnId that the current streaming card belongs to
 }
 
 // ─── Session Manager ─────────────────────────────────────────
 
 export class SessionManager {
   private sessions = new Map<string, Session>();
+  private creatingChats = new Map<string, FeishuMessage[]>(); // Messages arriving during createSession
   private readonly config: BridgeConfig;
   private readonly feishu: FeishuClient;
   private readonly larkClient: lark.Client;
@@ -89,58 +89,28 @@ export class SessionManager {
     }
 
     if (!session) {
-      session = await this.createSession(chatId, msg.chatType);
-      this.sessions.set(chatId, session);
+      // Guard against concurrent createSession for the same chatId
+      const pendingQueue = this.creatingChats.get(chatId);
+      if (pendingQueue) {
+        pendingQueue.push(msg);
+        return;
+      }
+      this.creatingChats.set(chatId, []);
+      try {
+        session = await this.createSession(chatId, msg.chatType);
+        this.sessions.set(chatId, session);
+        // Move messages that arrived during creation into session queue
+        const arrived = this.creatingChats.get(chatId) || [];
+        session.messageQueue.push(...arrived);
+      } finally {
+        this.creatingChats.delete(chatId);
+      }
     }
 
     session.lastActivityAt = Date.now();
     this.resetIdleTimer(session);
 
-    // Record transcript
-    session.transcript.push({
-      role: 'user',
-      content: msg.text,
-      timestamp: new Date().toISOString(),
-      imageCount: msg.images?.length,
-    });
-
-    // Run message pre hooks
-    await runHooks(this.config.hooks.message.pre, 'message.pre', {
-      chatId,
-      chatType: session.chatType,
-      role: 'user',
-      content: msg.text,
-      imageCount: msg.images?.length,
-    });
-
-    // ── Per-turn card management ──
-    // Advance turn counter
-    session.currentTurnId++;
-    const thisTurnId = session.currentTurnId;
-
-    // Abort existing streaming card if any (from previous turn)
-    if (session.streamingCard?.isActive()) {
-      await session.streamingCard.abort('新消息已到达');
-    }
-
-    // Abort previous progress card (it manages its own delete timer)
-    if (session.progressCard.isActive()) {
-      await session.progressCard.abort('新消息已到达');
-    }
-    session.progressCard = new ProgressCardController(this.larkClient, chatId);
-
-    // Create new streaming card for THIS turn
-    session.streamingCard = new StreamingCardController({
-      client: this.larkClient,
-      chatId,
-      onFallback: () => {
-        // Mark this card as failed — turn_complete handler will send plain text
-        logger.info({ chatId }, 'Streaming card fallback triggered');
-      },
-    });
-    session.turnId = thisTurnId;
-
-    // Download files if any (Fix #6)
+    // Download files first so transcript and hooks see the final message text
     if (msg.filePaths && msg.filePaths.length > 0) {
       const workspaceDir = resolve(
         this.config.claude.workspaceRoot,
@@ -150,22 +120,62 @@ export class SessionManager {
       mkdirSync(downloadDir, { recursive: true });
 
       for (const fp of msg.filePaths) {
-        const [fileKey, filename] = fp.split(':', 2);
-        if (fileKey && filename) {
-          const savePath = resolve(downloadDir, filename);
+        const [fileKey, rawFilename] = fp.split(':', 2);
+        if (fileKey && rawFilename) {
+          // Sanitize filename to prevent path traversal
+          const safeFilename = basename(rawFilename);
+          if (!safeFilename) continue;
+          const savePath = resolve(downloadDir, safeFilename);
+          // Verify resolved path stays inside downloadDir
+          if (!savePath.startsWith(downloadDir)) continue;
           const result = await this.feishu.downloadFile(
             msg.messageId,
             fileKey,
-            filename,
+            safeFilename,
             savePath,
           );
           if (result) {
-            // Append file path info to the message text
             msg.text += `\n[已下载文件: ${savePath}]`;
           }
         }
       }
     }
+
+    // Record transcript (after file download so content is complete)
+    session.transcript.push({
+      role: 'user',
+      content: msg.text,
+      timestamp: new Date().toISOString(),
+      imageCount: msg.images?.length,
+    });
+
+    // Run message pre hooks (sees final message including file paths)
+    await runHooks(this.config.hooks.message.pre, 'message.pre', {
+      chatId,
+      chatType: session.chatType,
+      role: 'user',
+      content: msg.text,
+      imageCount: msg.images?.length,
+    });
+
+    // ── Per-turn card management ──
+    if (session.streamingCard?.isActive()) {
+      await session.streamingCard.abort('新消息已到达');
+    }
+    if (session.progressCard.isActive()) {
+      await session.progressCard.abort('新消息已到达');
+    }
+    session.progressCard = new ProgressCardController(this.larkClient, chatId);
+
+    session.streamingCard = new StreamingCardController({
+      client: this.larkClient,
+      chatId,
+      onFallback: () => {
+        logger.info({ chatId }, 'Streaming card fallback triggered');
+      },
+    });
+    // Track which bridge turnId this card belongs to
+    session.turnId = session.claude.getTurnId();
 
     // Push message to Claude
     try {
@@ -235,7 +245,6 @@ export class SessionManager {
       maxDurationTimer: null,
       messageQueue: [],
       turnId: 0,
-      currentTurnId: 0,
     };
 
     // Run session pre hooks (await before starting Claude)
@@ -287,13 +296,17 @@ export class SessionManager {
           'Claude session initialized',
         );
 
-        // Flush queued messages through the normal handleMessage path
+        // Flush queued messages sequentially through the normal handleMessage path
         const queued = session.messageQueue.splice(0);
-        for (const queuedMsg of queued) {
-          this.handleMessage(queuedMsg).catch((err) => {
-            logger.error({ err, chatId }, 'Error replaying queued message');
-          });
-        }
+        (async () => {
+          for (const queuedMsg of queued) {
+            try {
+              await this.handleMessage(queuedMsg);
+            } catch (err) {
+              logger.error({ err, chatId }, 'Error replaying queued message');
+            }
+          }
+        })();
         break;
 
       case 'thinking_delta':
@@ -311,7 +324,7 @@ export class SessionManager {
 
       case 'text_delta':
         // Feed to streaming card (only if it belongs to the current turn)
-        if (session.streamingCard && session.turnId === session.currentTurnId) {
+        if (session.streamingCard && msg.turnId === session.turnId) {
           session.streamingCard.append(msg.text || '');
         }
         break;
@@ -335,7 +348,7 @@ export class SessionManager {
 
         // Complete streaming card or fallback to plain message
         const card = session.streamingCard;
-        if (card && session.turnId === session.currentTurnId) {
+        if (card && msg.turnId === session.turnId) {
           card.complete(finalText).catch(() => {
             // Fix #3: Fallback — send as plain text when card fails
             if (finalText) {

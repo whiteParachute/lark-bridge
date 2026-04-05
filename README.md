@@ -135,7 +135,7 @@ cp config/config.example.json ~/.lark-bridge/config.json
 
 ## 配置
 
-配置文件：`~/.lark-bridge/config.json`（可通过 `FEISHU_BRIDGE_CONFIG` 覆盖）。
+配置文件：`~/.lark-bridge/config.json`（可通过 `LARK_BRIDGE_CONFIG` 覆盖）。
 
 ```jsonc
 {
