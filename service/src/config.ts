@@ -71,6 +71,20 @@ const ConfigSchema = z.object({
       idleTimeoutMs: 30 * 60 * 1000,
       maxDurationMs: 4 * 60 * 60 * 1000,
     }),
+  globalSleep: z
+    .object({
+      /** Whether to enable the global_sleep scheduler. Default: true. */
+      enabled: z.boolean().default(true),
+      /** How often to check conditions, in ms. Default: 30 minutes. Min: 1 minute. */
+      checkIntervalMs: z.number().min(60_000).default(30 * 60 * 1000),
+      /** Minimum time between global_sleep runs, in ms. Default: 6 hours. Min: 1 hour. */
+      cooldownMs: z.number().min(3_600_000).default(6 * 60 * 60 * 1000),
+    })
+    .default({
+      enabled: true,
+      checkIntervalMs: 30 * 60 * 1000,
+      cooldownMs: 6 * 60 * 60 * 1000,
+    }),
   hooks: HooksSchema,
   daemon: z
     .object({
