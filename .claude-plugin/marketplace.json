@@ -1,0 +1,13 @@
+{
+  "name": "lark-bridge-marketplace",
+  "owner": {
+    "name": "whiteParachute"
+  },
+  "plugins": [
+    {
+      "name": "lark-bridge",
+      "description": "Bridge Feishu (飞书) conversations to Claude Code sessions with aria-memory integration, session lifecycle management, and streaming card output.",
+      "source": "."
+    }
+  ]
+}
