@@ -50,7 +50,7 @@ lark-bridge/                     # Claude Code plugin 根目录
 ├── skills/                        # Claude Code slash commands
 │   ├── lark-bridge              # /lark-bridge — daemon 管理
 │   ├── feishu-sessions            # /feishu-sessions — 查看活跃会话
-│   └── feishu-setup               # /feishu-setup — 初始配置向导
+│   └── lark-setup               # /lark-setup — 初始配置向导
 ├── service/                       # Daemon 组件
 │   ├── src/
 │   │   ├── index.ts               # Daemon 入口
@@ -113,7 +113,7 @@ claude --plugin-dir /path/to/lark-bridge
 在 Claude Code 中运行交互式配置向导：
 
 ```
-/feishu-setup
+/lark-setup
 ```
 
 向导会依次引导你完成：
@@ -124,7 +124,7 @@ claude --plugin-dir /path/to/lark-bridge
 4. **Daemon 模式** — nohup / systemd / launchd、是否开机自启
 5. **Hook 配置** — aria-memory 集成、自定义 hook
 
-配置保存到 `~/.lark-bridge/config.json`。后续可随时运行 `/feishu-setup reconfigure` 修改。
+配置保存到 `~/.lark-bridge/config.json`。后续可随时运行 `/lark-setup reconfigure` 修改。
 
 也可以手动创建配置文件：
 
@@ -230,7 +230,7 @@ bash scripts/service.sh uninstall   # 卸载服务
 在 Claude Code 中可通过 skills 管理：
 - `/lark-bridge start|stop|status` — daemon 管理
 - `/feishu-sessions` — 查看活跃会话列表
-- `/feishu-setup` — 初始配置向导
+- `/lark-setup` — 初始配置向导
 
 SessionStart hook 会在每次 Claude Code 会话启动时注入 daemon 运行状态。
 
