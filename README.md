@@ -73,18 +73,57 @@ lark-bridge/                     # Claude Code plugin 根目录
 
 ## 安装
 
-在目标 host 上（需已安装 Claude Code）：
+在目标 host 上（需已安装 Claude Code）。
+
+### 方式一：从 Plugin Marketplace 安装（推荐）
 
 ```bash
-# 1. 安装插件依赖并编译 daemon
-bash scripts/install.sh
+# 1. 添加插件到 marketplace
+claude plugin add whiteParachute/lark-bridge
 
-# 2. 创建配置
-cp config/config.example.json ~/.lark-bridge/config.json
-# 编辑填入飞书应用凭证和 host 参数
+# 2. 安装插件
+claude plugin install lark-bridge
 ```
 
-插件通过 Claude Code 的 plugin 发现机制自动加载（`.claude-plugin/plugin.json`）。
+安装完成后，插件会自动注册到 Claude Code，hooks 和 skills 立即可用。
+
+### 方式二：从源码安装
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/whiteParachute/lark-bridge.git
+
+# 2. 通过 --plugin-dir 指定本地插件目录启动 Claude Code
+claude --plugin-dir /path/to/lark-bridge
+```
+
+或者将插件目录添加到 Claude Code 的 settings.json 中持久生效：
+
+```json
+{
+  "pluginDirs": ["/path/to/lark-bridge"]
+}
+```
+
+### 编译 daemon 组件
+
+无论哪种安装方式，首次使用前需要编译 daemon：
+
+```bash
+# 进入插件目录执行安装脚本
+bash scripts/install.sh
+```
+
+### 配置
+
+```bash
+# 创建配置文件
+mkdir -p ~/.lark-bridge
+cp config/config.example.json ~/.lark-bridge/config.json
+# 编辑填入飞书应用凭证
+```
+
+或在 Claude Code 中直接运行 `/feishu-setup` 进入交互式配置向导。
 
 ## 配置
 
