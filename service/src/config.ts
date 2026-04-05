@@ -95,7 +95,7 @@ function expandHome(p: string): string {
 
 export function loadConfig(): BridgeConfig {
   const configPath =
-    process.env.FEISHU_BRIDGE_CONFIG ||
+    process.env.LARK_BRIDGE_CONFIG ||
     resolve(homedir(), '.lark-bridge', 'config.json');
 
   if (!existsSync(configPath)) {

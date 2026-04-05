@@ -1,7 +1,7 @@
 ---
 name: lark-bridge
 description: |
-  Manage the Feishu Bridge daemon. Start, stop, or check status of the
+  Manage the Lark Bridge daemon. Start, stop, or check status of the
   background service that bridges Feishu chat to Claude Code sessions.
   TRIGGER when: user says "feishu bridge", "start feishu", "stop feishu",
   "飞书桥", "启动飞书", "停止飞书"
@@ -9,7 +9,7 @@ argument-hint: <start|stop|status|restart>
 allowed-tools: [Bash, Read]
 ---
 
-Manage the Feishu Bridge daemon based on the argument:
+Manage the Lark Bridge daemon based on the argument:
 
 **start** (default if no argument):
 ```bash

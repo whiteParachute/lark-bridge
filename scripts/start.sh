@@ -23,7 +23,7 @@ fi
 if [ -f "$PID_FILE" ]; then
   PID=$(cat "$PID_FILE" 2>/dev/null || echo "")
   if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-    if ps -p "$PID" -o args= 2>/dev/null | grep -q "lark-bridge"; then
+    if ps -p "$PID" -o args= 2>/dev/null | grep -q "lark-bridge\|dist/index.js"; then
       echo "lark-bridge is already running (PID: $PID)"
       exit 0
     fi
@@ -39,7 +39,7 @@ fi
 
 # Start daemon
 mkdir -p "$BRIDGE_DIR"
-FEISHU_BRIDGE_CONFIG="$CONFIG_FILE" \
+LARK_BRIDGE_CONFIG="$CONFIG_FILE" \
   nohup node "$SERVICE_DIR/dist/index.js" >> "$LOG_FILE" 2>&1 &
 DAEMON_PID=$!
 echo "$DAEMON_PID" > "$PID_FILE"

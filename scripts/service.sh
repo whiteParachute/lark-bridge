@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICE_DIR="$SCRIPT_DIR/../service"
 BRIDGE_DIR="$HOME/.lark-bridge"
-CONFIG_FILE="${FEISHU_BRIDGE_CONFIG:-$BRIDGE_DIR/config.json}"
+CONFIG_FILE="${LARK_BRIDGE_CONFIG:-$BRIDGE_DIR/config.json}"
 LOG_FILE="$BRIDGE_DIR/bridge.log"
 PID_FILE="$BRIDGE_DIR/bridge.pid"
 NODE_BIN="$(command -v node 2>/dev/null || echo "")"
@@ -90,7 +90,7 @@ nohup_start() {
     rm -f "$PID_FILE"
   fi
 
-  FEISHU_BRIDGE_CONFIG="$CONFIG_FILE" \
+  LARK_BRIDGE_CONFIG="$CONFIG_FILE" \
     nohup "$NODE_BIN" "$SERVICE_DIR/dist/index.js" >> "$LOG_FILE" 2>&1 &
   local daemon_pid=$!
   echo "$daemon_pid" > "$PID_FILE"
@@ -159,7 +159,7 @@ Restart=on-failure
 RestartSec=5
 Environment=HOME=${HOME}
 Environment=PATH=${PATH}
-Environment=FEISHU_BRIDGE_CONFIG=${CONFIG_FILE}
+Environment=LARK_BRIDGE_CONFIG=${CONFIG_FILE}
 WorkingDirectory=${SERVICE_DIR}
 StandardOutput=append:${LOG_FILE}
 StandardError=append:${LOG_FILE}
@@ -249,7 +249,7 @@ launchd_install() {
 
   <key>EnvironmentVariables</key>
   <dict>
-    <key>FEISHU_BRIDGE_CONFIG</key>
+    <key>LARK_BRIDGE_CONFIG</key>
     <string>${CONFIG_FILE}</string>
     <key>HOME</key>
     <string>${HOME}</string>
