@@ -171,8 +171,11 @@ export class FeishuClient {
         data: { reaction_type: { emoji_type: emojiType } },
       });
       return res?.data?.reaction_id || null;
-    } catch (err) {
-      logger.debug({ err, messageId, emojiType }, 'Failed to add reaction');
+    } catch (err: any) {
+      logger.warn(
+        { messageId, emojiType, code: err?.code, msg: err?.msg || err?.message },
+        'Failed to add reaction',
+      );
       return null;
     }
   }
