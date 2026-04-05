@@ -44,6 +44,8 @@ interface Session {
   turnId: number; // Bridge turnId that the current streaming card belongs to
   /** Config snapshot captured at session creation — immune to later hot-reloads. */
   config: BridgeConfig;
+  /** Ack reaction on user's message: messageId → reactionId */
+  ackReaction: { messageId: string; reactionId: string } | null;
 }
 
 // ─── Session Manager ─────────────────────────────────────────
@@ -223,6 +225,13 @@ export class SessionManager {
     // Track which bridge turnId this card belongs to
     session.turnId = session.claude.getTurnId();
 
+    // Ack reaction: add "OnIt" emoji to user's message
+    this.feishu.addReaction(msg.messageId, 'OnIt').then((reactionId) => {
+      if (reactionId) {
+        session.ackReaction = { messageId: msg.messageId, reactionId };
+      }
+    });
+
     // Push message to Claude
     try {
       session.claude.pushMessage(msg.text, msg.images);
@@ -316,6 +325,7 @@ export class SessionManager {
       messageQueue: [],
       turnId: 0,
       config: sessionConfig,
+      ackReaction: null,
     };
 
     // Run session pre hooks (await before starting Claude)
@@ -407,6 +417,15 @@ export class SessionManager {
 
       case 'turn_complete': {
         const finalText = msg.text || '';
+
+        // Remove ack reaction from user's message
+        if (session.ackReaction) {
+          this.feishu.removeReaction(
+            session.ackReaction.messageId,
+            session.ackReaction.reactionId,
+          );
+          session.ackReaction = null;
+        }
 
         // Record transcript
         if (finalText) {
