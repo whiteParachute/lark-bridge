@@ -27,12 +27,12 @@ read_config() {
   fi
   # Extract daemon.mode and daemon.autoStart via node one-liner
   if [ -n "$NODE_BIN" ]; then
-    DAEMON_MODE="$("$NODE_BIN" -e "
-      const c = JSON.parse(require('fs').readFileSync('$CONFIG_FILE','utf-8'));
+    DAEMON_MODE="$(LARK_BRIDGE_CFG="$CONFIG_FILE" "$NODE_BIN" -e "
+      const c = JSON.parse(require('fs').readFileSync(process.env.LARK_BRIDGE_CFG,'utf-8'));
       console.log((c.daemon && c.daemon.mode) || 'nohup');
     ")"
-    AUTO_START="$("$NODE_BIN" -e "
-      const c = JSON.parse(require('fs').readFileSync('$CONFIG_FILE','utf-8'));
+    AUTO_START="$(LARK_BRIDGE_CFG="$CONFIG_FILE" "$NODE_BIN" -e "
+      const c = JSON.parse(require('fs').readFileSync(process.env.LARK_BRIDGE_CFG,'utf-8'));
       console.log((c.daemon && c.daemon.autoStart) === true ? 'true' : 'false');
     ")"
   else

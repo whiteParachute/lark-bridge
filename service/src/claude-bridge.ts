@@ -293,8 +293,8 @@ export class ClaudeBridge {
   async interrupt(): Promise<void> {
     try {
       await this.queryRef?.interrupt();
-    } catch {
-      // Best effort
+    } catch (err) {
+      logger.debug({ err }, 'interrupt() failed (best effort)');
     }
   }
 

@@ -154,8 +154,8 @@ export class FeishuClient {
         const ws = this.wsClient as any;
         if (typeof ws.stop === 'function') await ws.stop();
         else if (typeof ws.close === 'function') await ws.close();
-      } catch {
-        // Best effort
+      } catch (err) {
+        logger.debug({ err }, 'WSClient disconnect failed (best effort)');
       }
       this.wsClient = null;
     }
@@ -270,11 +270,13 @@ export class FeishuClient {
     // Dedup
     if (this.seenMessages.has(messageId)) return;
     this.seenMessages.set(messageId, Date.now());
-    // Cleanup old entries periodically
+    // Cleanup: keep at most 1000 entries, drop oldest half when exceeded
     if (this.seenMessages.size > 1000) {
-      const cutoff = Date.now() - 30 * 60 * 1000;
-      for (const [id, ts] of this.seenMessages) {
-        if (ts < cutoff) this.seenMessages.delete(id);
+      const entries = [...this.seenMessages.entries()]
+        .sort((a, b) => a[1] - b[1]);
+      const toDelete = entries.slice(0, Math.floor(entries.length / 2));
+      for (const [id] of toDelete) {
+        this.seenMessages.delete(id);
       }
     }
 
