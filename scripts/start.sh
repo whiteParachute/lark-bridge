@@ -58,8 +58,18 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-# Ensure built
+# Ensure built — rebuild if dist is missing or src is newer than dist
+NEEDS_BUILD=false
 if [ ! -f "$SERVICE_DIR/dist/index.js" ]; then
+  NEEDS_BUILD=true
+else
+  # Check if any src file is newer than dist/index.js
+  NEWER_SRC="$(find "$SERVICE_DIR/src" -name '*.ts' -newer "$SERVICE_DIR/dist/index.js" 2>/dev/null | head -1)"
+  if [ -n "$NEWER_SRC" ]; then
+    NEEDS_BUILD=true
+  fi
+fi
+if [ "$NEEDS_BUILD" = "true" ]; then
   echo "Building service..."
   cd "$SERVICE_DIR" && npm run build
 fi

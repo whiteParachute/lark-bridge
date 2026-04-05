@@ -46,6 +46,9 @@ interface Session {
   config: BridgeConfig;
   /** Ack reaction on user's message: messageId → reactionId */
   ackReaction: { messageId: string; reactionId: string } | null;
+  /** Resolves when the current turn completes — used to sequence card ownership */
+  turnCompleteResolve: (() => void) | null;
+  turnCompletePromise: Promise<void> | null;
 }
 
 // ─── Session Manager ─────────────────────────────────────────
@@ -203,6 +206,15 @@ export class SessionManager {
     });
 
     // ── Per-turn card management ──
+    // Wait for the previous turn to complete before taking card ownership,
+    // so turn_complete events are correctly attributed to the right card.
+    if (session.turnCompletePromise) {
+      await Promise.race([
+        session.turnCompletePromise,
+        new Promise((r) => setTimeout(r, 30_000)), // safety timeout
+      ]);
+    }
+
     if (session.streamingCard?.isActive()) {
       await session.streamingCard.abort('新消息已到达');
     }
@@ -222,8 +234,12 @@ export class SessionManager {
         }
       },
     });
-    // Track which bridge turnId this card belongs to
+    // Track which bridge turnId this card belongs to (now safe — previous turn is done)
     session.turnId = session.claude.getTurnId();
+    // Create a promise that resolves when this turn completes
+    session.turnCompletePromise = new Promise((resolve) => {
+      session.turnCompleteResolve = resolve;
+    });
 
     // Ack reaction: add "OnIt" emoji to user's message
     this.feishu.addReaction(msg.messageId, 'OnIt').then((reactionId) => {
@@ -326,6 +342,8 @@ export class SessionManager {
       turnId: 0,
       config: sessionConfig,
       ackReaction: null,
+      turnCompleteResolve: null,
+      turnCompletePromise: null,
     };
 
     // Run session pre hooks (await before starting Claude)
@@ -381,13 +399,14 @@ export class SessionManager {
         const queued = session.messageQueue.splice(0);
         if (queued.length > 0) {
           const mergedText = queued.map((m) => m.text).join('\n---\n');
-          // Collect all images from queued messages
           const mergedImages = queued.flatMap((m) => m.images ?? []);
+          const mergedFilePaths = queued.flatMap((m) => m.filePaths ?? []);
           // Use the last message as the base (for chatId, chatType, etc.)
           const merged: FeishuMessage = {
             ...queued[queued.length - 1],
             text: mergedText,
             images: mergedImages.length > 0 ? mergedImages : undefined,
+            filePaths: mergedFilePaths.length > 0 ? mergedFilePaths : undefined,
           };
           this.handleMessage(merged).catch((err) => {
             logger.error({ err, chatId }, 'Error replaying merged queued messages');
@@ -475,6 +494,13 @@ export class SessionManager {
           });
         }
 
+        // Signal turn completion so next message can safely take card ownership
+        if (session.turnCompleteResolve) {
+          session.turnCompleteResolve();
+          session.turnCompleteResolve = null;
+          session.turnCompletePromise = null;
+        }
+
         // Create fresh progress card for next turn.
         // Old card manages its own delete timer via complete() — don't reset it.
         session.progressCard = new ProgressCardController(this.larkClient, chatId);
@@ -483,6 +509,12 @@ export class SessionManager {
 
       case 'error':
         logger.error({ chatId, error: msg.error }, 'Claude session error');
+        // Signal turn completion on error too
+        if (session.turnCompleteResolve) {
+          session.turnCompleteResolve();
+          session.turnCompleteResolve = null;
+          session.turnCompletePromise = null;
+        }
         if (session.streamingCard?.isActive()) {
           session.streamingCard.abort(`错误: ${msg.error}`).catch(() => {});
           session.streamingCard = null;

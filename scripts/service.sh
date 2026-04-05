@@ -63,7 +63,18 @@ preflight() {
     echo "ERROR: Config not found at $CONFIG_FILE"
     exit 1
   fi
+  # Rebuild if dist is missing or src is newer than dist
+  local needs_build=false
   if [ ! -f "$SERVICE_DIR/dist/index.js" ]; then
+    needs_build=true
+  else
+    local newer_src
+    newer_src="$(find "$SERVICE_DIR/src" -name '*.ts' -newer "$SERVICE_DIR/dist/index.js" 2>/dev/null | head -1)"
+    if [ -n "$newer_src" ]; then
+      needs_build=true
+    fi
+  fi
+  if [ "$needs_build" = "true" ]; then
     echo "Building service..."
     cd "$SERVICE_DIR" && npm run build
   fi
