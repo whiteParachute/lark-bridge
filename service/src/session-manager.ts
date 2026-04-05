@@ -19,7 +19,7 @@ import { ProgressCardController } from './progress-card.js';
 import { type TranscriptEntry } from './memory-wrapup.js';
 import { runHooks } from './hooks.js';
 import { type FeishuClient, type FeishuMessage } from './feishu.js';
-import { type BridgeConfig } from './config.js';
+import { type BridgeConfig, reloadConfig } from './config.js';
 import { logger } from './logger.js';
 import * as lark from '@larksuiteoapi/node-sdk';
 
@@ -42,6 +42,8 @@ interface Session {
   maxDurationTimer: ReturnType<typeof setTimeout> | null;
   messageQueue: FeishuMessage[];
   turnId: number; // Bridge turnId that the current streaming card belongs to
+  /** Config snapshot captured at session creation — immune to later hot-reloads. */
+  config: BridgeConfig;
 }
 
 // ─── Session Manager ─────────────────────────────────────────
@@ -49,7 +51,7 @@ interface Session {
 export class SessionManager {
   private sessions = new Map<string, Session>();
   private creatingChats = new Map<string, FeishuMessage[]>(); // Messages arriving during createSession
-  private readonly config: BridgeConfig;
+  private config: BridgeConfig;
   private readonly feishu: FeishuClient;
   private readonly larkClient: lark.Client;
   private statusInterval: ReturnType<typeof setInterval> | null = null;
@@ -72,6 +74,12 @@ export class SessionManager {
   }
 
   async handleMessage(msg: FeishuMessage): Promise<void> {
+    // Hot-reload config so allowlist changes take effect without daemon restart
+    const freshConfig = reloadConfig();
+    if (freshConfig) {
+      this.config = freshConfig;
+    }
+
     // ── Security: allowlist check ──
     if (!this.isAllowed(msg)) {
       logger.info(
@@ -121,7 +129,7 @@ export class SessionManager {
     // Download files first so transcript and hooks see the final message text
     if (msg.filePaths && msg.filePaths.length > 0) {
       const workspaceDir = resolve(
-        this.config.claude.workspaceRoot,
+        session.config.claude.workspaceRoot,
         chatId.replace(/[^a-zA-Z0-9_-]/g, '_'),
       );
       const downloadDir = resolve(workspaceDir, 'downloads');
@@ -158,7 +166,7 @@ export class SessionManager {
     });
 
     // Run message pre hooks (sees final message including file paths)
-    await runHooks(this.config.hooks.message.pre, 'message.pre', {
+    await runHooks(session.config.hooks.message.pre, 'message.pre', {
       chatId,
       chatType: session.chatType,
       role: 'user',
@@ -228,8 +236,11 @@ export class SessionManager {
   }
 
   private async createSession(chatId: string, chatType: 'p2p' | 'group'): Promise<Session> {
+    // Snapshot current config — this session uses it for its entire lifetime
+    const sessionConfig = structuredClone(this.config);
+
     const workspaceDir = resolve(
-      this.config.claude.workspaceRoot,
+      sessionConfig.claude.workspaceRoot,
       chatId.replace(/[^a-zA-Z0-9_-]/g, '_'),
     );
     if (!existsSync(workspaceDir)) {
@@ -253,11 +264,12 @@ export class SessionManager {
       maxDurationTimer: null,
       messageQueue: [],
       turnId: 0,
+      config: sessionConfig,
     };
 
     // Run session pre hooks (await before starting Claude)
     try {
-      await runHooks(this.config.hooks.session.pre, 'session.pre', {
+      await runHooks(sessionConfig.hooks.session.pre, 'session.pre', {
         chatId,
         chatType,
         transcript: session.transcript,
@@ -269,10 +281,10 @@ export class SessionManager {
     // Start Claude session
     claude.start(
       {
-        model: this.config.claude.model,
+        model: sessionConfig.claude.model,
         cwd: workspaceDir,
-        additionalDirectories: this.config.claude.additionalDirectories,
-        permissionMode: this.config.claude.permissionMode,
+        additionalDirectories: sessionConfig.claude.additionalDirectories,
+        permissionMode: sessionConfig.claude.permissionMode,
       },
       (msg) => this.handleStreamMessage(session, msg),
     );
@@ -282,11 +294,11 @@ export class SessionManager {
       logger.info({ chatId }, 'Session max duration reached');
       this.closeSession(
         session,
-        '会话已达最长时限，自动关闭。发送新消息可开启新对话。',
+        '会���已达最长时限，自动关闭。���送新消息可开���新对��。',
       ).catch((err) => {
         logger.error({ err, chatId }, 'Error closing max-duration session');
       });
-    }, this.config.session.maxDurationMs);
+    }, sessionConfig.session.maxDurationMs);
 
     logger.info({ chatId, chatType, workspaceDir }, 'Session created');
     return session;
@@ -378,7 +390,7 @@ export class SessionManager {
 
         // Run message post hooks
         if (finalText) {
-          runHooks(this.config.hooks.message.post, 'message.post', {
+          runHooks(session.config.hooks.message.post, 'message.post', {
             chatId,
             chatType: session.chatType,
             role: 'assistant',
@@ -416,14 +428,14 @@ export class SessionManager {
       logger.info({ chatId: session.chatId }, 'Session idle timeout');
       this.closeSession(
         session,
-        '会话空闲超时，已自动关闭。发送新消息可开启新对话。',
+        '会话空闲超时，已自动关��。发送���消息可开启新对话。',
       ).catch((err) => {
         logger.error(
           { err, chatId: session.chatId },
           'Error closing idle session',
         );
       });
-    }, this.config.session.idleTimeoutMs);
+    }, session.config.session.idleTimeoutMs);
   }
 
   private async closeSession(
@@ -464,7 +476,7 @@ export class SessionManager {
     session.streamingCard?.dispose();
 
     // Run session post hooks (includes aria-memory-wrapup by default)
-    await runHooks(this.config.hooks.session.post, 'session.post', {
+    await runHooks(session.config.hooks.session.post, 'session.post', {
       chatId: session.chatId,
       chatType: session.chatType,
       sessionId: session.sessionId,

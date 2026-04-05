@@ -51,6 +51,8 @@ const ConfigSchema = z.object({
       model: z.string().default('sonnet'),
       workspaceRoot: z.string().default('~/workspace/lark-bridge'),
       additionalDirectories: z.array(z.string()).default([]),
+      /** Allow Claude to access all directories under $HOME. Default: false. */
+      allowAllDirectories: z.boolean().default(false),
       /** Permission mode for Claude sessions. Default: plan (safer). */
       permissionMode: z
         .enum(['bypassPermissions', 'plan', 'default'])
@@ -60,6 +62,7 @@ const ConfigSchema = z.object({
       model: 'sonnet',
       workspaceRoot: '~/workspace/lark-bridge',
       additionalDirectories: [],
+      allowAllDirectories: false,
       permissionMode: 'plan',
     }),
   session: z
@@ -107,11 +110,14 @@ function expandHome(p: string): string {
   return p.startsWith('~/') ? resolve(homedir(), p.slice(2)) : resolve(p);
 }
 
-export function loadConfig(): BridgeConfig {
-  const configPath =
+function getConfigPath(): string {
+  return (
     process.env.LARK_BRIDGE_CONFIG ||
-    resolve(homedir(), '.lark-bridge', 'config.json');
+    resolve(homedir(), '.lark-bridge', 'config.json')
+  );
+}
 
+function parseConfig(configPath: string): BridgeConfig {
   if (!existsSync(configPath)) {
     throw new Error(
       `Config file not found: ${configPath}\nRun /lark-setup to create it.`,
@@ -135,5 +141,29 @@ export function loadConfig(): BridgeConfig {
   config.claude.additionalDirectories =
     config.claude.additionalDirectories.map(expandHome);
 
+  // allowAllDirectories: inject $HOME as an additional directory
+  if (config.claude.allowAllDirectories) {
+    const home = homedir();
+    if (!config.claude.additionalDirectories.includes(home)) {
+      config.claude.additionalDirectories.push(home);
+    }
+  }
+
   return config;
+}
+
+export function loadConfig(): BridgeConfig {
+  return parseConfig(getConfigPath());
+}
+
+/**
+ * Hot-reload config from disk. Returns the fresh config,
+ * or null if parsing fails (caller should keep using old config).
+ */
+export function reloadConfig(): BridgeConfig | null {
+  try {
+    return parseConfig(getConfigPath());
+  } catch (err) {
+    return null;
+  }
 }
