@@ -48,9 +48,22 @@ interface Session {
 
 // ─── Session Manager ─────────────────────────────────────────
 
+// ─── Rate Limiter (per-chat token bucket) ───────────────────
+
+const RATE_LIMIT_MAX_TOKENS = 5;
+const RATE_LIMIT_REFILL_MS = 60_000; // 1 token per 12s → 5 tokens/min
+
+interface RateBucket {
+  tokens: number;
+  lastRefill: number;
+}
+
+// ─── Session Manager ─────────────────────────────────────────
+
 export class SessionManager {
   private sessions = new Map<string, Session>();
   private creatingChats = new Map<string, FeishuMessage[]>(); // Messages arriving during createSession
+  private rateBuckets = new Map<string, RateBucket>();
   private config: BridgeConfig;
   private readonly feishu: FeishuClient;
   private readonly larkClient: lark.Client;
@@ -85,6 +98,16 @@ export class SessionManager {
       logger.info(
         { chatId: msg.chatId, sender: msg.senderOpenId },
         'Message rejected: sender/chat not in allowlist',
+      );
+      return;
+    }
+
+    // ── Rate limiting (per-chat) ──
+    if (!this.consumeRateToken(msg.chatId)) {
+      logger.warn({ chatId: msg.chatId }, 'Rate limit exceeded');
+      await this.feishu.sendMessage(
+        msg.chatId,
+        '⚠️ 消息频率过高，请稍后再试。',
       );
       return;
     }
@@ -136,7 +159,10 @@ export class SessionManager {
       mkdirSync(downloadDir, { recursive: true });
 
       for (const fp of msg.filePaths) {
-        const [fileKey, rawFilename] = fp.split(':', 2);
+        const colonIdx = fp.indexOf(':');
+        if (colonIdx < 0) continue;
+        const fileKey = fp.slice(0, colonIdx);
+        const rawFilename = fp.slice(colonIdx + 1);
         if (fileKey && rawFilename) {
           // Sanitize filename to prevent path traversal
           const safeFilename = basename(rawFilename);
@@ -188,6 +214,10 @@ export class SessionManager {
       chatId,
       onFallback: () => {
         logger.info({ chatId }, 'Streaming card fallback triggered');
+        const text = session.streamingCard?.getAccumulatedText();
+        if (text) {
+          this.feishu.sendMessage(chatId, text).catch(() => {});
+        }
       },
     });
     // Track which bridge turnId this card belongs to
@@ -221,6 +251,27 @@ export class SessionManager {
   }
 
   // ─── Internal ──────────────────────────────────────────
+
+  private consumeRateToken(chatId: string): boolean {
+    const now = Date.now();
+    let bucket = this.rateBuckets.get(chatId);
+    if (!bucket) {
+      bucket = { tokens: RATE_LIMIT_MAX_TOKENS, lastRefill: now };
+      this.rateBuckets.set(chatId, bucket);
+    }
+    // Refill tokens based on elapsed time
+    const elapsed = now - bucket.lastRefill;
+    const refill = Math.floor(elapsed / (RATE_LIMIT_REFILL_MS / RATE_LIMIT_MAX_TOKENS));
+    if (refill > 0) {
+      bucket.tokens = Math.min(RATE_LIMIT_MAX_TOKENS, bucket.tokens + refill);
+      bucket.lastRefill = now;
+    }
+    if (bucket.tokens > 0) {
+      bucket.tokens--;
+      return true;
+    }
+    return false;
+  }
 
   private isAllowed(msg: FeishuMessage): boolean {
     const { allowedSenders, allowedChats } = this.config.feishu;
@@ -316,17 +367,22 @@ export class SessionManager {
           'Claude session initialized',
         );
 
-        // Flush queued messages sequentially through the normal handleMessage path
+        // Flush queued messages: merge into a single message to avoid card churn
         const queued = session.messageQueue.splice(0);
-        (async () => {
-          for (const queuedMsg of queued) {
-            try {
-              await this.handleMessage(queuedMsg);
-            } catch (err) {
-              logger.error({ err, chatId }, 'Error replaying queued message');
-            }
-          }
-        })();
+        if (queued.length > 0) {
+          const mergedText = queued.map((m) => m.text).join('\n---\n');
+          // Collect all images from queued messages
+          const mergedImages = queued.flatMap((m) => m.images ?? []);
+          // Use the last message as the base (for chatId, chatType, etc.)
+          const merged: FeishuMessage = {
+            ...queued[queued.length - 1],
+            text: mergedText,
+            images: mergedImages.length > 0 ? mergedImages : undefined,
+          };
+          this.handleMessage(merged).catch((err) => {
+            logger.error({ err, chatId }, 'Error replaying merged queued messages');
+          });
+        }
         break;
 
       case 'thinking_delta':
@@ -457,8 +513,8 @@ export class SessionManager {
     // Fix #5: interrupt first, then end
     try {
       await session.claude.interrupt();
-    } catch {
-      // Best effort
+    } catch (err) {
+      logger.debug({ err, chatId: session.chatId }, 'interrupt() failed (best effort)');
     }
 
     try {
@@ -467,8 +523,8 @@ export class SessionManager {
         session.claude.waitForCompletion(),
         new Promise((r) => setTimeout(r, 5000)),
       ]);
-    } catch {
-      // Best effort
+    } catch (err) {
+      logger.debug({ err, chatId: session.chatId }, 'end()/waitForCompletion() failed (best effort)');
     }
 
     // Clean up cards
@@ -518,8 +574,8 @@ export class SessionManager {
           2,
         ),
       );
-    } catch {
-      // Non-critical
+    } catch (err) {
+      logger.debug({ err }, 'Failed to write status.json');
     }
   }
 }

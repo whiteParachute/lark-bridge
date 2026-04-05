@@ -35,13 +35,10 @@ function buildCard(
   let title = '';
   let bodyStartIdx = 0;
 
-  for (let i = 0; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-    if (/^#{1,3}\s+/.test(lines[i])) {
-      title = lines[i].replace(/^#+\s*/, '').trim();
-      bodyStartIdx = i + 1;
-    }
-    break;
+  const firstNonEmptyIdx = lines.findIndex((l) => l.trim());
+  if (firstNonEmptyIdx >= 0 && /^#{1,3}\s+/.test(lines[firstNonEmptyIdx])) {
+    title = lines[firstNonEmptyIdx].replace(/^#+\s*/, '').trim();
+    bodyStartIdx = firstNonEmptyIdx + 1;
   }
 
   const body = lines.slice(bodyStartIdx).join('\n').trim();
@@ -267,6 +264,10 @@ export class StreamingCardController {
         // Best effort
       }
     }
+  }
+
+  getAccumulatedText(): string {
+    return this.accumulatedText;
   }
 
   dispose(): void {

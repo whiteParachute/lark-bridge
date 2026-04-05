@@ -185,16 +185,6 @@ export class ProgressCardController {
     }
   }
 
-  /** Reset for next turn (reuse same controller). */
-  reset(): void {
-    this.dispose();
-    this.state = 'idle';
-    this.messageId = null;
-    this.tools = [];
-    this.thinkingText = '';
-    this.dirty = false;
-  }
-
   // ─── Internal ──────────────────────────────────────────
 
   private markDirty(): void {
