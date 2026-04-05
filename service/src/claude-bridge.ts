@@ -152,9 +152,13 @@ export class ClaudeBridge {
             // Auto-approve tool use — no interactive terminal in bridge mode.
             // Without this callback, SDK cannot relay permission prompts and
             // the turn terminates abnormally, causing context loss.
-            canUseTool: async (toolName, input, callOpts) => {
-              logger.debug({ toolName }, 'Auto-approving tool use in bridge mode');
-              return { behavior: 'allow' as const, toolUseID: callOpts.toolUseID };
+            canUseTool: async (toolName, _input, callOpts) => {
+              logger.info({ toolName }, 'Auto-approving tool use in bridge mode');
+              return {
+                behavior: 'allow' as const,
+                toolUseID: callOpts.toolUseID,
+                updatedPermissions: callOpts.suggestions,
+              };
             },
           },
         });
