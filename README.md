@@ -81,11 +81,11 @@ lark-bridge/                     # Claude Code plugin 根目录
 # 1. 添加插件到 marketplace
 claude plugin add whiteParachute/lark-bridge
 
-# 2. 安装插件
+# 2. 安装插件（自动编译 daemon 组件）
 claude plugin install lark-bridge
 ```
 
-安装完成后，插件会自动注册到 Claude Code，hooks 和 skills 立即可用。
+安装完成后，插件自动注册到 Claude Code，daemon 自动编译，hooks 和 skills 立即可用。
 
 ### 方式二：从源码安装
 
@@ -93,7 +93,10 @@ claude plugin install lark-bridge
 # 1. 克隆仓库
 git clone https://github.com/whiteParachute/lark-bridge.git
 
-# 2. 通过 --plugin-dir 指定本地插件目录启动 Claude Code
+# 2. 编译 daemon
+cd lark-bridge && bash scripts/install.sh
+
+# 3. 通过 --plugin-dir 指定本地插件目录启动 Claude Code
 claude --plugin-dir /path/to/lark-bridge
 ```
 
@@ -105,25 +108,30 @@ claude --plugin-dir /path/to/lark-bridge
 }
 ```
 
-### 编译 daemon 组件
-
-无论哪种安装方式，首次使用前需要编译 daemon：
-
-```bash
-# 进入插件目录执行安装脚本
-bash scripts/install.sh
-```
-
 ### 配置
 
-```bash
-# 创建配置文件
-mkdir -p ~/.lark-bridge
-cp config/config.example.json ~/.lark-bridge/config.json
-# 编辑填入飞书应用凭证
+在 Claude Code 中运行交互式配置向导：
+
+```
+/feishu-setup
 ```
 
-或在 Claude Code 中直接运行 `/feishu-setup` 进入交互式配置向导。
+向导会依次引导你完成：
+
+1. **飞书应用凭证** — App ID、App Secret、访问控制
+2. **Claude 设置** — 模型选择、权限模式、工作目录
+3. **会话参数** — 空闲超时、最大时长
+4. **Daemon 模式** — nohup / systemd / launchd、是否开机自启
+5. **Hook 配置** — aria-memory 集成、自定义 hook
+
+配置保存到 `~/.lark-bridge/config.json`。后续可随时运行 `/feishu-setup reconfigure` 修改。
+
+也可以手动创建配置文件：
+
+```bash
+mkdir -p ~/.lark-bridge
+cp config/config.example.json ~/.lark-bridge/config.json
+```
 
 ## 配置
 

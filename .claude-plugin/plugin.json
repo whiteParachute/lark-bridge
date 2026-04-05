@@ -6,5 +6,6 @@
     "name": "whiteParachute"
   },
   "license": "MIT",
-  "keywords": ["feishu", "lark", "bridge", "chat", "im"]
+  "keywords": ["feishu", "lark", "bridge", "chat", "im"],
+  "postInstall": "bash scripts/install.sh"
 }
