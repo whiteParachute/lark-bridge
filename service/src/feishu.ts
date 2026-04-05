@@ -162,6 +162,35 @@ export class FeishuClient {
   }
 
   /**
+   * Add an emoji reaction to a message. Returns the reaction_id for later removal.
+   */
+  async addReaction(messageId: string, emojiType: string): Promise<string | null> {
+    try {
+      const res = await (this.client.im.messageReaction.create as any)({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+      return res?.data?.reaction_id || null;
+    } catch (err) {
+      logger.debug({ err, messageId, emojiType }, 'Failed to add reaction');
+      return null;
+    }
+  }
+
+  /**
+   * Remove an emoji reaction from a message.
+   */
+  async removeReaction(messageId: string, reactionId: string): Promise<void> {
+    try {
+      await (this.client.im.messageReaction.delete as any)({
+        path: { message_id: messageId, reaction_id: reactionId },
+      });
+    } catch (err) {
+      logger.debug({ err, messageId, reactionId }, 'Failed to remove reaction');
+    }
+  }
+
+  /**
    * Send a text message (as interactive card).
    */
   async sendMessage(chatId: string, text: string): Promise<string | undefined> {
