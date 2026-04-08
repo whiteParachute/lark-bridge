@@ -7,6 +7,7 @@
  */
 import * as lark from '@larksuiteoapi/node-sdk';
 import { logger } from './logger.js';
+import { withRetry } from './retry.js';
 
 // ─── Card Template Builders ───────────────────────────────────
 
@@ -282,19 +283,27 @@ export class StreamingCardController {
 
     let resp: any;
     if (this.replyToMsgId) {
-      resp = await this.client.im.message.reply({
-        path: { message_id: this.replyToMsgId },
-        data: { content, msg_type: 'interactive' },
-      });
+      resp = await withRetry(
+        () =>
+          this.client.im.message.reply({
+            path: { message_id: this.replyToMsgId! },
+            data: { content, msg_type: 'interactive' },
+          }),
+        { label: 'streamingCard.reply' },
+      );
     } else {
-      resp = await this.client.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: this.chatId,
-          msg_type: 'interactive',
-          content,
-        },
-      });
+      resp = await withRetry(
+        () =>
+          this.client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: this.chatId,
+              msg_type: 'interactive',
+              content,
+            },
+          }),
+        { label: 'streamingCard.create' },
+      );
     }
 
     this.messageId = resp?.data?.message_id || null;

@@ -6,6 +6,7 @@
  */
 import * as lark from '@larksuiteoapi/node-sdk';
 import { logger } from './logger.js';
+import { withRetry } from './retry.js';
 
 // ─── Types ───────────────────────────────────────────────────
 
@@ -166,10 +167,14 @@ export class FeishuClient {
    */
   async addReaction(messageId: string, emojiType: string): Promise<string | null> {
     try {
-      const res = await (this.client.im.messageReaction.create as any)({
-        path: { message_id: messageId },
-        data: { reaction_type: { emoji_type: emojiType } },
-      });
+      const res: any = await withRetry(
+        () =>
+          (this.client.im.messageReaction.create as any)({
+            path: { message_id: messageId },
+            data: { reaction_type: { emoji_type: emojiType } },
+          }),
+        { label: 'addReaction' },
+      );
       return res?.data?.reaction_id || null;
     } catch (err: any) {
       logger.warn(
@@ -199,27 +204,35 @@ export class FeishuClient {
   async sendMessage(chatId: string, text: string): Promise<string | undefined> {
     const card = this.buildSimpleCard(text);
     try {
-      const resp = await this.client.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'interactive',
-          content: JSON.stringify(card),
-        },
-      });
+      const resp = await withRetry(
+        () =>
+          this.client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'interactive',
+              content: JSON.stringify(card),
+            },
+          }),
+        { label: 'sendMessage.card' },
+      );
       return resp?.data?.message_id || undefined;
     } catch (err: any) {
       // Fallback to plain text if card fails
       logger.warn({ err, chatId }, 'Card send failed, trying plain text');
       try {
-        const resp = await this.client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'text',
-            content: JSON.stringify({ text }),
-          },
-        });
+        const resp = await withRetry(
+          () =>
+            this.client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chatId,
+                msg_type: 'text',
+                content: JSON.stringify({ text }),
+              },
+            }),
+          { label: 'sendMessage.text' },
+        );
         return resp?.data?.message_id || undefined;
       } catch (err2) {
         logger.error({ err: err2, chatId }, 'Plain text send also failed');
