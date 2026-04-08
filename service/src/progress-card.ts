@@ -10,6 +10,7 @@
  */
 import * as lark from '@larksuiteoapi/node-sdk';
 import { logger } from './logger.js';
+import { withRetry } from './retry.js';
 
 type ProgressState = 'idle' | 'creating' | 'active' | 'completed' | 'aborted';
 
@@ -211,14 +212,18 @@ export class ProgressCardController {
     const card = buildProgressCard(this.tools, this.thinkingText, 'active');
     const content = JSON.stringify(card);
 
-    const resp = await this.client.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: this.chatId,
-        msg_type: 'interactive',
-        content,
-      },
-    });
+    const resp = await withRetry(
+      () =>
+        this.client.im.v1.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: this.chatId,
+            msg_type: 'interactive',
+            content,
+          },
+        }),
+      { label: 'progressCard.create' },
+    );
 
     this.messageId = resp?.data?.message_id || null;
     if (!this.messageId) {
