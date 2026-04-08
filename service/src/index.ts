@@ -9,6 +9,7 @@ import { logger, initLogger } from './logger.js';
 import { FeishuClient } from './feishu.js';
 import { SessionManager } from './session-manager.js';
 import { GlobalSleepScheduler } from './memory-sleep.js';
+import { PendingWrapupConsumer } from './wrapup-consumer.js';
 import { mkdirSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -51,13 +52,43 @@ async function main(): Promise<void> {
   // Initialize session manager
   sessionManager = new SessionManager(config, feishu);
 
-  // Start global_sleep scheduler
+  // Start memory maintenance schedulers.
+  //
+  // Two jobs coordinate via memory-maintenance.ts shared flag:
+  //   - PendingWrapupConsumer: runs every 30min (check interval), fires
+  //     when pending >= threshold and cooldown > 1h. Takes priority.
+  //   - GlobalSleepScheduler: runs every 30min (check interval), fires
+  //     when cooldown > 6h and pending > 0 but *below* wrapup threshold.
+  //     Sleep defers to wrapup so the queue drains before the heavier
+  //     maintenance pass.
+  let wrapupConsumer: PendingWrapupConsumer | null = null;
+  if (config.wrapupConsumer.enabled) {
+    wrapupConsumer = new PendingWrapupConsumer(
+      {
+        checkIntervalMs: config.wrapupConsumer.checkIntervalMs,
+        cooldownMs: config.wrapupConsumer.cooldownMs,
+        pendingThreshold: config.wrapupConsumer.pendingThreshold,
+        pendingMaxAgeMs: config.wrapupConsumer.pendingMaxAgeMs,
+      },
+      () => sessionManager.hasActiveSessions(),
+    );
+    wrapupConsumer.start();
+  }
+
   let sleepScheduler: GlobalSleepScheduler | null = null;
   if (config.globalSleep.enabled) {
     sleepScheduler = new GlobalSleepScheduler(
       {
         checkIntervalMs: config.globalSleep.checkIntervalMs,
         cooldownMs: config.globalSleep.cooldownMs,
+        minNewImpressions: config.globalSleep.minNewImpressions,
+        staleAfterMs: config.globalSleep.staleAfterMs,
+        // Defer to wrapup when pending is at/above wrapup's threshold. If
+        // wrapup is disabled, deferToWrapupAbove stays undefined and sleep
+        // behaves exactly as before.
+        deferToWrapupAbove: config.wrapupConsumer.enabled
+          ? config.wrapupConsumer.pendingThreshold
+          : undefined,
       },
       () => sessionManager.hasActiveSessions(),
     );
@@ -76,6 +107,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'Shutting down...');
 
     try {
+      wrapupConsumer?.stop();
       sleepScheduler?.stop();
       await sessionManager.closeAll('服务维护中，会话已关闭。');
       await feishu.disconnect();

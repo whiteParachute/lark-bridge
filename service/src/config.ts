@@ -80,13 +80,64 @@ const ConfigSchema = z.object({
       enabled: z.boolean().default(true),
       /** How often to check conditions, in ms. Default: 30 minutes. Min: 1 minute. */
       checkIntervalMs: z.number().min(60_000).default(30 * 60 * 1000),
-      /** Minimum time between global_sleep runs, in ms. Default: 6 hours. Min: 1 hour. */
+      /**
+       * Minimum time between global_sleep runs, in ms. Default: 6 hours.
+       * Min: 1 hour. This is the floor — sleep never fires more often than
+       * this regardless of new work.
+       */
       cooldownMs: z.number().min(3_600_000).default(6 * 60 * 60 * 1000),
+      /**
+       * Strong-trigger heuristic: fire when at least this many new impression
+       * files exist in ~/.aria-memory/impressions/ since the last successful
+       * sleep (mtime > lastGlobalSleepAt). Default 2, mirrors aria-memory's
+       * own SessionStart hook recommendation.
+       */
+      minNewImpressions: z.number().min(1).default(2),
+      /**
+       * Strong-trigger heuristic: fire when this much wall-clock time has
+       * passed since the last successful sleep, regardless of new work
+       * count. Default 12 hours, mirrors aria-memory's SessionStart hook.
+       * Min: 1 hour (must be >= cooldownMs to be meaningful).
+       */
+      staleAfterMs: z.number().min(3_600_000).default(12 * 60 * 60 * 1000),
     })
     .default({
       enabled: true,
       checkIntervalMs: 30 * 60 * 1000,
       cooldownMs: 6 * 60 * 60 * 1000,
+      minNewImpressions: 2,
+      staleAfterMs: 12 * 60 * 60 * 1000,
+    }),
+  wrapupConsumer: z
+    .object({
+      /** Whether to enable the pending wrapup consumer scheduler. Default: true. */
+      enabled: z.boolean().default(true),
+      /** How often to check conditions, in ms. Default: 30 minutes. Min: 1 minute. */
+      checkIntervalMs: z.number().min(60_000).default(30 * 60 * 1000),
+      /** Minimum time between successful wrapup runs, in ms. Default: 1 hour. Min: 5 minutes. */
+      cooldownMs: z.number().min(300_000).default(60 * 60 * 1000),
+      /**
+       * Primary trigger: fire when pendingWrapups.length >= this. Also
+       * doubles as the threshold at which global_sleep defers to wrapup
+       * (so the queue drains before the heavier sleep pass runs). Default 5
+       * — high enough to amortize per-invocation claude startup cost.
+       */
+      pendingThreshold: z.number().min(1).default(5),
+      /**
+       * Age-based fallback: even if pending is below pendingThreshold,
+       * fire when the oldest pending entry has been waiting longer than
+       * this. Without this, a steady-state of 1-4 pending would never get
+       * drained until the queue piled up. Default 6h, mirrors the
+       * global_sleep cooldown. Min 1h.
+       */
+      pendingMaxAgeMs: z.number().min(3_600_000).default(6 * 60 * 60 * 1000),
+    })
+    .default({
+      enabled: true,
+      checkIntervalMs: 30 * 60 * 1000,
+      cooldownMs: 60 * 60 * 1000,
+      pendingThreshold: 5,
+      pendingMaxAgeMs: 6 * 60 * 60 * 1000,
     }),
   hooks: HooksSchema,
   daemon: z
