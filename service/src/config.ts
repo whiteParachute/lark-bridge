@@ -69,10 +69,16 @@ const ConfigSchema = z.object({
     .object({
       idleTimeoutMs: z.number().default(30 * 60 * 1000),
       maxDurationMs: z.number().default(4 * 60 * 60 * 1000),
+      /** Enable session resume across closes/restarts. Default: true. */
+      resumeEnabled: z.boolean().default(true),
+      /** Max age for stored session mappings, in ms. Default: 7 days. */
+      resumeMaxAgeMs: z.number().default(7 * 24 * 60 * 60 * 1000),
     })
     .default({
       idleTimeoutMs: 30 * 60 * 1000,
       maxDurationMs: 4 * 60 * 60 * 1000,
+      resumeEnabled: true,
+      resumeMaxAgeMs: 7 * 24 * 60 * 60 * 1000,
     }),
   globalSleep: z
     .object({

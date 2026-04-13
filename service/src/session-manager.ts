@@ -21,6 +21,7 @@ import { runHooks } from './hooks.js';
 import { type FeishuClient, type FeishuMessage } from './feishu.js';
 import { type BridgeConfig, reloadConfig } from './config.js';
 import { logger } from './logger.js';
+import { SessionStore } from './session-store.js';
 import * as lark from '@larksuiteoapi/node-sdk';
 
 // ─── Types ───────────────────────────────────────────────────
@@ -38,6 +39,8 @@ interface Session {
   createdAt: number;
   lastActivityAt: number;
   sessionId?: string;
+  /** Whether this session attempted to resume a previous one */
+  resumeAttempted?: boolean;
   idleTimer: ReturnType<typeof setTimeout> | null;
   maxDurationTimer: ReturnType<typeof setTimeout> | null;
   messageQueue: FeishuMessage[];
@@ -72,12 +75,14 @@ export class SessionManager {
   private config: BridgeConfig;
   private readonly feishu: FeishuClient;
   private readonly larkClient: lark.Client;
+  private readonly sessionStore: SessionStore;
   private statusInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: BridgeConfig, feishu: FeishuClient) {
     this.config = config;
     this.feishu = feishu;
     this.larkClient = feishu.getLarkClient();
+    this.sessionStore = new SessionStore(undefined, config.session.resumeMaxAgeMs);
 
     this.statusInterval = setInterval(() => this.writeStatus(), 10_000);
     this.writeStatus();
@@ -357,6 +362,12 @@ export class SessionManager {
       logger.error({ err, chatId }, 'Session pre hook failed');
     }
 
+    // Look up previous sessionId for resume
+    const previousSessionId = sessionConfig.session.resumeEnabled
+      ? this.sessionStore.get(chatId)
+      : undefined;
+    session.resumeAttempted = !!previousSessionId;
+
     // Start Claude session
     claude.start(
       {
@@ -364,16 +375,21 @@ export class SessionManager {
         cwd: workspaceDir,
         additionalDirectories: sessionConfig.claude.additionalDirectories,
         permissionMode: sessionConfig.claude.permissionMode,
+        sessionId: previousSessionId,
       },
       (msg) => this.handleStreamMessage(session, msg),
     );
+
+    if (previousSessionId) {
+      logger.info({ chatId, previousSessionId }, 'Attempting to resume previous session');
+    }
 
     // Fix #8: max duration timer
     session.maxDurationTimer = setTimeout(() => {
       logger.info({ chatId }, 'Session max duration reached');
       this.closeSession(
         session,
-        '会���已达最长时限，自动关闭。���送新消息可开���新对��。',
+        '会话已达最长时限，自动关闭。发送新消息将自动恢复上下文。',
       ).catch((err) => {
         logger.error({ err, chatId }, 'Error closing max-duration session');
       });
@@ -390,8 +406,12 @@ export class SessionManager {
       case 'session_init':
         session.sessionId = msg.sessionId;
         session.state = 'active';
+        // Persist chatId → sessionId mapping for future resume
+        if (msg.sessionId) {
+          this.sessionStore.set(chatId, msg.sessionId, session.chatType);
+        }
         logger.info(
-          { chatId, sessionId: msg.sessionId },
+          { chatId, sessionId: msg.sessionId, resumed: !!session.resumeAttempted },
           'Claude session initialized',
         );
 
@@ -507,9 +527,49 @@ export class SessionManager {
         break;
       }
 
-      case 'error':
+      case 'error': {
         logger.error({ chatId, error: msg.error }, 'Claude session error');
-        // Signal turn completion on error too
+
+        // If resume failed during startup, retry with fresh session
+        if (session.resumeAttempted && session.state === 'starting') {
+          logger.warn({ chatId }, 'Resume failed, retrying with fresh session');
+          session.resumeAttempted = false;
+          this.sessionStore.delete(chatId);
+
+          // Clean up current state
+          if (session.turnCompleteResolve) {
+            session.turnCompleteResolve();
+            session.turnCompleteResolve = null;
+            session.turnCompletePromise = null;
+          }
+          if (session.streamingCard?.isActive()) {
+            session.streamingCard.abort('重试中...').catch(() => {});
+            session.streamingCard = null;
+          }
+          session.progressCard.abort('重试中...').catch(() => {});
+
+          // Restart with fresh Claude session (no sessionId = no resume)
+          const freshClaude = new ClaudeBridge();
+          session.claude = freshClaude;
+          session.state = 'starting';
+          session.progressCard = new ProgressCardController(this.larkClient, chatId);
+          const workspaceDir = resolve(
+            session.config.claude.workspaceRoot,
+            chatId.replace(/[^a-zA-Z0-9_-]/g, '_'),
+          );
+          freshClaude.start(
+            {
+              model: session.config.claude.model,
+              cwd: workspaceDir,
+              additionalDirectories: session.config.claude.additionalDirectories,
+              permissionMode: session.config.claude.permissionMode,
+            },
+            (m) => this.handleStreamMessage(session, m),
+          );
+          break;
+        }
+
+        // Normal error handling
         if (session.turnCompleteResolve) {
           session.turnCompleteResolve();
           session.turnCompleteResolve = null;
@@ -525,6 +585,7 @@ export class SessionManager {
           .catch(() => {});
         this.closeSession(session, undefined).catch(() => {});
         break;
+      }
     }
   }
 
@@ -535,7 +596,7 @@ export class SessionManager {
       logger.info({ chatId: session.chatId }, 'Session idle timeout');
       this.closeSession(
         session,
-        '会话空闲超时，已自动关��。发送���消息可开启新对话。',
+        '会话空闲超时，已自动关闭。发送新消息将自动恢复上下文。',
       ).catch((err) => {
         logger.error(
           { err, chatId: session.chatId },
