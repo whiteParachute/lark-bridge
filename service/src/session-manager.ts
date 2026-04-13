@@ -257,6 +257,25 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Close a single session by chatId. Returns true if found and closed.
+   * The next message from this chat will automatically create a fresh session.
+   */
+  async closeSessionByChatId(chatId: string, reason?: string): Promise<boolean> {
+    const session = this.sessions.get(chatId);
+    if (!session || session.state === 'closing' || session.state === 'closed') {
+      return false;
+    }
+    if (session.streamingCard?.isActive()) {
+      await session.streamingCard.abort(reason || '会话重置').catch(() => {});
+    }
+    if (session.progressCard.isActive()) {
+      await session.progressCard.abort(reason || '会话重置').catch(() => {});
+    }
+    await this.closeSession(session, reason);
+    return true;
+  }
+
   async closeAll(reason = '服务维护中'): Promise<void> {
     if (this.statusInterval) {
       clearInterval(this.statusInterval);

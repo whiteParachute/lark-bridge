@@ -31,4 +31,14 @@ bash ${CLAUDE_PLUGIN_ROOT}/scripts/status.sh
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/stop.sh && sleep 1 && bash ${CLAUDE_PLUGIN_ROOT}/scripts/start.sh
 ```
 
+**reset** (close session, next message starts fresh with latest config/rules/memory):
+```bash
+bash ${CLAUDE_PLUGIN_ROOT}/scripts/reset.sh
+```
+
+**reset `<chatId>`** (close a specific session only):
+```bash
+bash ${CLAUDE_PLUGIN_ROOT}/scripts/reset.sh <chatId>
+```
+
 Report the result to the user. If the config file `~/.lark-bridge/config.json` doesn't exist, suggest running `/lark-setup` first.

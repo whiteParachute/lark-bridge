@@ -10,7 +10,7 @@ import { FeishuClient } from './feishu.js';
 import { SessionManager } from './session-manager.js';
 import { GlobalSleepScheduler } from './memory-sleep.js';
 import { PendingWrapupConsumer } from './wrapup-consumer.js';
-import { mkdirSync, existsSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -121,6 +121,37 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // ── Per-session control via SIGUSR1 + control file ──
+  const controlFile = resolve(bridgeDir, 'control.json');
+  process.on('SIGUSR1', () => {
+    (async () => {
+      try {
+        const raw = readFileSync(controlFile, 'utf-8');
+        unlinkSync(controlFile); // consume command immediately
+        const cmd = JSON.parse(raw) as { action: string; chatId?: string; reason?: string };
+        const reason = cmd.reason || '会话已重置，下条消息将使用最新配置。';
+
+        if (cmd.action === 'close' && cmd.chatId) {
+          const ok = await sessionManager.closeSessionByChatId(cmd.chatId, reason);
+          logger.info({ chatId: cmd.chatId, found: ok }, 'Control: close session');
+        } else if (cmd.action === 'close-all') {
+          await sessionManager.closeAll(reason);
+          logger.info('Control: close all sessions');
+        } else {
+          logger.warn({ cmd }, 'Control: unknown action');
+        }
+      } catch (err: any) {
+        if (err?.code === 'ENOENT') {
+          // No control file — treat SIGUSR1 as close-all (convenience shortcut)
+          await sessionManager.closeAll('会话已重置，下条消息将使用最新配置。');
+          logger.info('Control: SIGUSR1 without control file, closed all sessions');
+        } else {
+          logger.warn({ err }, 'Control: failed to process command');
+        }
+      }
+    })().catch((err) => logger.error({ err }, 'Control handler error'));
+  });
 
   // Keep alive
   await new Promise(() => {});
