@@ -21,10 +21,18 @@ export interface FeishuMessage {
   createTimeMs: number;
 }
 
+export interface WsWatchdogConfig {
+  enabled: boolean;
+  maxConsecutiveFailures: number;
+  reconnectCooldownMs: number;
+  silenceTimeoutMs: number;
+}
+
 export interface FeishuClientOptions {
   appId: string;
   appSecret: string;
   onMessage: (msg: FeishuMessage) => void;
+  wsWatchdog?: WsWatchdogConfig;
 }
 
 // ─── Message Content Extraction ──────────────────────────────
@@ -106,11 +114,20 @@ function extractMessageContent(
 export class FeishuClient {
   private client: lark.Client;
   private wsClient: lark.WSClient | null = null;
+  private eventDispatcher: lark.EventDispatcher | null = null;
   private readonly appId: string;
   private readonly appSecret: string;
   private readonly onMessage: (msg: FeishuMessage) => void;
   private seenMessages = new Map<string, number>(); // messageId → timestamp
   private startedAt = Date.now();
+
+  // ── WS Watchdog state ──
+  private readonly watchdog: WsWatchdogConfig;
+  private consecutiveWsFailures = 0;
+  private lastMessageAt = Date.now();
+  private lastReconnectAt = 0;
+  private isReconnecting = false;
+  private silenceTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: FeishuClientOptions) {
     this.appId = opts.appId;
@@ -121,6 +138,12 @@ export class FeishuClient {
       appType: lark.AppType.SelfBuild,
     });
     this.onMessage = opts.onMessage;
+    this.watchdog = opts.wsWatchdog ?? {
+      enabled: true,
+      maxConsecutiveFailures: 5,
+      reconnectCooldownMs: 60_000,
+      silenceTimeoutMs: 30 * 60 * 1000,
+    };
   }
 
   getLarkClient(): lark.Client {
@@ -128,7 +151,7 @@ export class FeishuClient {
   }
 
   async connect(): Promise<void> {
-    const eventDispatcher = new lark.EventDispatcher({}).register({
+    this.eventDispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data) => {
         try {
           await this.handleMessage(data);
@@ -142,23 +165,182 @@ export class FeishuClient {
       appId: this.appId,
       appSecret: this.appSecret,
       loggerLevel: lark.LoggerLevel.info,
+      logger: this.createWatchdogLogger(),
     });
 
-    await this.wsClient.start({ eventDispatcher });
+    await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
+    this.consecutiveWsFailures = 0;
+    this.lastMessageAt = Date.now();
     logger.info('Feishu WebSocket connected');
+
+    // Start silence watchdog timer
+    this.startSilenceTimer();
   }
 
   async disconnect(): Promise<void> {
-    if (this.wsClient) {
-      try {
-        // WSClient may not expose stop() in all SDK versions — best effort
-        const ws = this.wsClient as any;
-        if (typeof ws.stop === 'function') await ws.stop();
-        else if (typeof ws.close === 'function') await ws.close();
-      } catch (err) {
-        logger.debug({ err }, 'WSClient disconnect failed (best effort)');
+    this.stopSilenceTimer();
+    this.closeWsClient();
+  }
+
+  // ── WS Watchdog ────────────────────────────────────────
+
+  /**
+   * Create a custom logger for WSClient that intercepts error/info messages
+   * to detect consecutive connection failures.
+   */
+  /**
+   * Close the current WSClient. Extracted to avoid duck-typing duplication.
+   */
+  private closeWsClient(): void {
+    if (!this.wsClient) return;
+    try {
+      const ws = this.wsClient as any;
+      if (typeof ws.close === 'function') ws.close({ force: true });
+      else if (typeof ws.stop === 'function') ws.stop();
+    } catch (err) {
+      logger.debug({ err }, 'WSClient close failed (best effort)');
+    }
+    this.wsClient = null;
+  }
+
+  private createWatchdogLogger(): {
+    error: (...msg: any[]) => void;
+    warn: (...msg: any[]) => void;
+    info: (...msg: any[]) => void;
+    debug: (...msg: any[]) => void;
+    trace: (...msg: any[]) => void;
+  } {
+    const self = this;
+    const wsFailurePatterns = [
+      /timeout of \d+ms exceeded/,
+      /unable to connect/i,
+      /send data failed/i,
+      /write EPIPE/i,
+      /socket hang up/i,
+      /ECONNRESET/i,
+      /ECONNREFUSED/i,
+    ];
+
+    function flattenArgs(args: any[]): string {
+      return args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+    }
+
+    function checkForFailure(...args: any[]): void {
+      const msg = flattenArgs(args);
+      for (const pattern of wsFailurePatterns) {
+        if (pattern.test(msg)) {
+          self.onWsFailure(msg);
+          return;
+        }
       }
-      this.wsClient = null;
+    }
+
+    // Lark SDK passes mixed types (strings, arrays, objects) to its logger.
+    // pino expects (obj?, msg, ...interpolation). We flatten SDK args into
+    // a single string to be safe with pino's API.
+    function pinoLog(level: 'error' | 'warn' | 'info' | 'debug' | 'trace', args: any[]): void {
+      logger[level]({ sdk: 'ws' }, flattenArgs(args));
+    }
+
+    return {
+      error: (...args: any[]) => { pinoLog('error', args); checkForFailure(...args); },
+      warn:  (...args: any[]) => { pinoLog('warn', args); checkForFailure(...args); },
+      info:  (...args: any[]) => { pinoLog('info', args); },
+      debug: (...args: any[]) => { pinoLog('debug', args); },
+      trace: (...args: any[]) => { pinoLog('trace', args); },
+    };
+  }
+
+  private onWsFailure(detail: string): void {
+    if (!this.watchdog.enabled) return;
+
+    this.consecutiveWsFailures++;
+    logger.warn(
+      { consecutiveFailures: this.consecutiveWsFailures, max: this.watchdog.maxConsecutiveFailures, detail },
+      'WS connection failure detected',
+    );
+
+    if (this.consecutiveWsFailures >= this.watchdog.maxConsecutiveFailures) {
+      this.triggerReconnect('consecutive_failures');
+    }
+  }
+
+  private async triggerReconnect(reason: string): Promise<void> {
+    if (this.isReconnecting) return;
+
+    const now = Date.now();
+    const sinceLast = now - this.lastReconnectAt;
+    if (sinceLast < this.watchdog.reconnectCooldownMs) {
+      logger.info(
+        { reason, cooldownRemainingSec: Math.ceil((this.watchdog.reconnectCooldownMs - sinceLast) / 1000) },
+        'Reconnect cooldown active, skipping',
+      );
+      return;
+    }
+
+    this.isReconnecting = true;
+    this.lastReconnectAt = now;
+    logger.info(
+      { reason, consecutiveFailures: this.consecutiveWsFailures },
+      'Watchdog triggering WS reconnect',
+    );
+
+    try {
+      // Tear down old connection
+      this.closeWsClient();
+
+      // Small delay to let things settle
+      await new Promise(r => setTimeout(r, 2000));
+
+      // Create fresh WSClient
+      this.wsClient = new lark.WSClient({
+        appId: this.appId,
+        appSecret: this.appSecret,
+        loggerLevel: lark.LoggerLevel.info,
+        logger: this.createWatchdogLogger(),
+      });
+
+      await this.wsClient.start({ eventDispatcher: this.eventDispatcher! });
+      this.consecutiveWsFailures = 0;
+      this.lastMessageAt = Date.now();
+      this.startSilenceTimer();
+      logger.info('WS reconnect successful');
+    } catch (err) {
+      logger.error({ err, reason }, 'WS reconnect failed');
+      // Schedule a retry after cooldown instead of waiting for silence timer
+      const retryMs = this.watchdog.reconnectCooldownMs;
+      logger.info(
+        { retryInSec: Math.ceil(retryMs / 1000) },
+        'Scheduling reconnect retry after cooldown',
+      );
+      setTimeout(() => this.triggerReconnect('reconnect_retry'), retryMs);
+    } finally {
+      this.isReconnecting = false;
+    }
+  }
+
+  private startSilenceTimer(): void {
+    this.stopSilenceTimer();
+    if (!this.watchdog.enabled || this.watchdog.silenceTimeoutMs <= 0) return;
+
+    // Check every 5 minutes
+    const checkInterval = Math.min(this.watchdog.silenceTimeoutMs / 2, 5 * 60 * 1000);
+    this.silenceTimer = setInterval(() => {
+      const silenceDuration = Date.now() - this.lastMessageAt;
+      if (silenceDuration >= this.watchdog.silenceTimeoutMs) {
+        logger.warn(
+          { silenceMinutes: Math.round(silenceDuration / 60_000) },
+          'No messages received for extended period, triggering reconnect',
+        );
+        this.triggerReconnect('silence_timeout');
+      }
+    }, checkInterval);
+  }
+
+  private stopSilenceTimer(): void {
+    if (this.silenceTimer) {
+      clearInterval(this.silenceTimer);
+      this.silenceTimer = null;
     }
   }
 
@@ -311,6 +493,10 @@ export class FeishuClient {
   private async handleMessage(data: any): Promise<void> {
     const message = data.message;
     const messageId = message.message_id;
+
+    // WS is alive — reset failure counter
+    this.consecutiveWsFailures = 0;
+    this.lastMessageAt = Date.now();
 
     // Dedup
     if (this.seenMessages.has(messageId)) return;
