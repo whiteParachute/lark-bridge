@@ -63,15 +63,19 @@ async function runHook(
   hook: HookDef,
   phase: string,
   ctx: SessionHookContext | MessageHookContext,
+  ariaMemoryVariant?: 'vanilla' | 'custom',
 ): Promise<void> {
   switch (hook.type) {
     case 'aria-memory-wrapup': {
       const sessionCtx = ctx as SessionHookContext;
       if (sessionCtx.transcript && sessionCtx.transcript.length > 0) {
+        // vanilla: export transcript only; custom: also register in meta.json
+        const registerPending = ariaMemoryVariant === 'custom';
         await exportAndRegisterWrapup(
           sessionCtx.chatId,
           sessionCtx.chatType,
           sessionCtx.transcript,
+          registerPending,
         );
       }
       break;
@@ -122,15 +126,19 @@ async function runHook(
 
 /**
  * Run a list of hooks sequentially.
+ *
+ * @param ariaMemoryVariant - Passed through to aria-memory-wrapup hooks
+ *   to control whether meta.json registration happens.
  */
 export async function runHooks(
   hooks: HookDef[],
   phase: string,
   ctx: SessionHookContext | MessageHookContext,
+  ariaMemoryVariant?: 'vanilla' | 'custom',
 ): Promise<void> {
   for (const hook of hooks) {
     try {
-      await runHook(hook, phase, ctx);
+      await runHook(hook, phase, ctx, ariaMemoryVariant);
     } catch (err) {
       logger.error({ err, phase, hookType: hook.type }, 'Hook execution failed');
       // Continue to next hook — one failure shouldn't block others

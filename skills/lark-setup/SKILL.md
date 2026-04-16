@@ -87,16 +87,29 @@ Ask the user to choose:
 2. If `service` selected, ask:
    - **Auto-start on boot** — Yes / No (default: No)
 
-## Step 5: Hook Configuration
+## Step 5: Memory & Hook Configuration
+
+### 5a. aria-memory Integration
 
 Ask the user:
 
 1. **Enable aria-memory integration?** — present options:
-   - **Yes** (Recommended) — export transcripts to aria-memory on session close
-   - **No** — disable memory integration
+   - **No** (Default) — no memory persistence, pure Feishu↔Claude bridge
+   - **Yes, vanilla** — export session transcripts only. aria-memory plugin's own hooks handle the rest. Good for standard aria-memory setups.
+   - **Yes, custom** — full integration: transcript export + meta.json pendingWrapups + daemon-side GlobalSleepScheduler + PendingWrapupConsumer. Requires a custom aria-memory vault with meta.json support.
+
+2. If **Yes (vanilla or custom)** selected, ask:
+   - **Memory directory** — text input with default `~/.aria-memory`. Where the aria-memory vault lives.
+
+Config mapping:
+- **No** → `"ariaMemory": { "enabled": false }` — no `hooks.session.post` injection
+- **Yes, vanilla** → `"ariaMemory": { "enabled": true, "variant": "vanilla", "memoryDir": "<path>" }` — auto-injects `aria-memory-wrapup` hook
+- **Yes, custom** → `"ariaMemory": { "enabled": true, "variant": "custom", "memoryDir": "<path>" }` — auto-injects hook + enables globalSleep + wrapupConsumer
+
+### 5b. Custom Hooks
 
 2. **Add custom hooks?** — present options:
-   - **No** (Recommended) — use defaults
+   - **No** (Recommended) — use defaults (auto-injected based on aria-memory selection above)
    - **Yes** — ask for shell command to run (and which phase: session.pre / session.post / message.pre / message.post)
 
 ## Step 6: Write Configuration

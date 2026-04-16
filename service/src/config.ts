@@ -19,12 +19,9 @@ const HooksSchema = z
     session: z
       .object({
         pre: z.array(HookDefSchema).default([]),
-        post: z.array(HookDefSchema).default([{ type: 'aria-memory-wrapup' as const }]),
+        post: z.array(HookDefSchema).default([]),
       })
-      .default({
-        pre: [],
-        post: [{ type: 'aria-memory-wrapup' as const }],
-      }),
+      .default({ pre: [], post: [] }),
     message: z
       .object({
         pre: z.array(HookDefSchema).default([]),
@@ -33,11 +30,37 @@ const HooksSchema = z
       .default({ pre: [], post: [] }),
   })
   .default({
-    session: { pre: [], post: [{ type: 'aria-memory-wrapup' as const }] },
+    session: { pre: [], post: [] },
     message: { pre: [], post: [] },
   });
 
 const ConfigSchema = z.object({
+  /**
+   * aria-memory integration toggle. When enabled, lark-bridge will:
+   *   - Export session transcripts to memoryDir/transcripts/
+   *   - Register pending wrapups in memoryDir/meta.json
+   *   - Run GlobalSleepScheduler and PendingWrapupConsumer
+   *   - Auto-inject aria-memory-wrapup hook into session.post (if hooks not explicitly set)
+   *
+   * When disabled (default), none of the above runs — lark-bridge operates as
+   * a pure Feishu↔Claude bridge with no memory persistence.
+   */
+  ariaMemory: z
+    .object({
+      enabled: z.boolean().default(false),
+      /**
+       * Integration variant:
+       *   - "vanilla": Export transcripts only. No meta.json, no daemon schedulers.
+       *     Relies on aria-memory plugin's own hooks for processing.
+       *   - "custom": Full integration — transcript export + meta.json pendingWrapups
+       *     registration + GlobalSleepScheduler + PendingWrapupConsumer.
+       *     Requires the custom aria-memory vault with meta.json support.
+       */
+      variant: z.enum(['vanilla', 'custom']).default('vanilla'),
+      /** Path to the aria-memory vault directory. Default: ~/.aria-memory */
+      memoryDir: z.string().default('~/.aria-memory'),
+    })
+    .default({ enabled: false, variant: 'vanilla', memoryDir: '~/.aria-memory' }),
   feishu: z.object({
     appId: z.string().min(1),
     appSecret: z.string().min(1),
@@ -76,8 +99,8 @@ const ConfigSchema = z.object({
     }),
   globalSleep: z
     .object({
-      /** Whether to enable the global_sleep scheduler. Default: true. */
-      enabled: z.boolean().default(true),
+      /** Whether to enable the global_sleep scheduler. Default: false (auto-enabled when ariaMemory.enabled=true). */
+      enabled: z.boolean().optional(),
       /** How often to check conditions, in ms. Default: 30 minutes. Min: 1 minute. */
       checkIntervalMs: z.number().min(60_000).default(30 * 60 * 1000),
       /**
@@ -102,7 +125,6 @@ const ConfigSchema = z.object({
       staleAfterMs: z.number().min(3_600_000).default(12 * 60 * 60 * 1000),
     })
     .default({
-      enabled: true,
       checkIntervalMs: 30 * 60 * 1000,
       cooldownMs: 6 * 60 * 60 * 1000,
       minNewImpressions: 2,
@@ -110,8 +132,8 @@ const ConfigSchema = z.object({
     }),
   wrapupConsumer: z
     .object({
-      /** Whether to enable the pending wrapup consumer scheduler. Default: true. */
-      enabled: z.boolean().default(true),
+      /** Whether to enable the pending wrapup consumer scheduler. Default: false (auto-enabled when ariaMemory.enabled=true). */
+      enabled: z.boolean().optional(),
       /** How often to check conditions, in ms. Default: 30 minutes. Min: 1 minute. */
       checkIntervalMs: z.number().min(60_000).default(30 * 60 * 1000),
       /** Minimum time between successful wrapup runs, in ms. Default: 1 hour. Min: 5 minutes. */
@@ -133,11 +155,38 @@ const ConfigSchema = z.object({
       pendingMaxAgeMs: z.number().min(3_600_000).default(6 * 60 * 60 * 1000),
     })
     .default({
-      enabled: true,
       checkIntervalMs: 30 * 60 * 1000,
       cooldownMs: 60 * 60 * 1000,
       pendingThreshold: 5,
       pendingMaxAgeMs: 6 * 60 * 60 * 1000,
+    }),
+  wsWatchdog: z
+    .object({
+      /** Enable automatic reconnect when WS fails consecutively. Default: true. */
+      enabled: z.boolean().default(true),
+      /**
+       * Trigger reconnect after this many consecutive WS connection failures.
+       * The Lark SDK logs "[ws] timeout" or "unable to connect" on each attempt.
+       * Default: 5.
+       */
+      maxConsecutiveFailures: z.number().min(2).default(5),
+      /**
+       * Minimum wait between reconnect attempts, in ms. Prevents tight
+       * reconnect loops when the network is down. Default: 60 seconds.
+       */
+      reconnectCooldownMs: z.number().min(10_000).default(60_000),
+      /**
+       * Safety-net: if no message has been received for this long AND no
+       * reconnect failures have been counted (SDK silently died), force a
+       * reconnect. Default: 30 minutes. 0 = disabled.
+       */
+      silenceTimeoutMs: z.number().min(0).default(30 * 60 * 1000),
+    })
+    .default({
+      enabled: true,
+      maxConsecutiveFailures: 5,
+      reconnectCooldownMs: 60_000,
+      silenceTimeoutMs: 30 * 60 * 1000,
     }),
   hooks: HooksSchema,
   daemon: z
@@ -197,6 +246,55 @@ function parseConfig(configPath: string): BridgeConfig {
     const home = homedir();
     if (!config.claude.additionalDirectories.includes(home)) {
       config.claude.additionalDirectories.push(home);
+    }
+  }
+
+  // Expand ariaMemory.memoryDir
+  config.ariaMemory.memoryDir = expandHome(config.ariaMemory.memoryDir);
+
+  // ── aria-memory auto-wiring ──
+  //
+  // Three modes:
+  //   1. disabled (enabled=false): no memory, no hooks, no schedulers
+  //   2. vanilla  (enabled=true, variant="vanilla"): transcript export only,
+  //      no meta.json manipulation, no daemon schedulers
+  //   3. custom   (enabled=true, variant="custom"): full integration with
+  //      meta.json pendingWrapups + GlobalSleepScheduler + PendingWrapupConsumer
+  //
+  if (config.ariaMemory.enabled) {
+    // Auto-inject aria-memory-wrapup hook into session.post if not
+    // explicitly configured by the user.
+    const hasWrapupHook = config.hooks.session.post.some(
+      (h) => h.type === 'aria-memory-wrapup',
+    );
+    if (!hasWrapupHook && !raw.hooks?.session?.post) {
+      config.hooks.session.post.push({ type: 'aria-memory-wrapup' });
+    }
+
+    if (config.ariaMemory.variant === 'custom') {
+      // Custom mode: auto-enable schedulers unless explicitly disabled
+      if (config.globalSleep.enabled === undefined) {
+        (config.globalSleep as any).enabled = true;
+      }
+      if (config.wrapupConsumer.enabled === undefined) {
+        (config.wrapupConsumer as any).enabled = true;
+      }
+    } else {
+      // Vanilla mode: schedulers off (they need meta.json infrastructure)
+      if (config.globalSleep.enabled === undefined) {
+        (config.globalSleep as any).enabled = false;
+      }
+      if (config.wrapupConsumer.enabled === undefined) {
+        (config.wrapupConsumer as any).enabled = false;
+      }
+    }
+  } else {
+    // Disabled: force everything off
+    if (config.globalSleep.enabled === undefined) {
+      (config.globalSleep as any).enabled = false;
+    }
+    if (config.wrapupConsumer.enabled === undefined) {
+      (config.wrapupConsumer as any).enabled = false;
     }
   }
 

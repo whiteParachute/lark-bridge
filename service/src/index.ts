@@ -10,6 +10,7 @@ import { FeishuClient } from './feishu.js';
 import { SessionManager } from './session-manager.js';
 import { GlobalSleepScheduler } from './memory-sleep.js';
 import { PendingWrapupConsumer } from './wrapup-consumer.js';
+import { initMemoryPaths } from './meta-lock.js';
 import { mkdirSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -36,6 +37,19 @@ async function main(): Promise<void> {
     mkdirSync(config.claude.workspaceRoot, { recursive: true });
   }
 
+  // Initialize aria-memory paths (even when disabled — modules import
+  // ARIA_MEMORY_DIR at module level, so it must be set before any tick)
+  initMemoryPaths(config.ariaMemory.memoryDir);
+  if (config.ariaMemory.enabled) {
+    logger.info(
+      {
+        variant: config.ariaMemory.variant,
+        memoryDir: config.ariaMemory.memoryDir,
+      },
+      'aria-memory integration enabled',
+    );
+  }
+
   // Initialize Feishu client
   let sessionManager: SessionManager;
 
@@ -47,6 +61,7 @@ async function main(): Promise<void> {
         logger.error({ err, chatId: msg.chatId }, 'Error handling message');
       });
     },
+    wsWatchdog: config.wsWatchdog,
   });
 
   // Initialize session manager

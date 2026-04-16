@@ -218,7 +218,7 @@ export class PendingWrapupConsumer {
     // One deviation: we drop the "BEFORE responding to the user's first
     // message" framing, which is meaningless in a headless `-p` invocation
     // where the prompt body *is* the user message.
-    const memoryDir = `${homedir()}/.aria-memory`;
+    const memoryDir = ARIA_MEMORY_DIR;
     const prompt = [
       '## CRITICAL: Pending Memory Wrapups',
       '',
