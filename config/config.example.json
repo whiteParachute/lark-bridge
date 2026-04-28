@@ -5,12 +5,16 @@
     "allowedSenders": ["ou_your_open_id"],
     "allowedChats": []
   },
+  "defaultBackend": "claude",
   "claude": {
     "model": "sonnet",
     "workspaceRoot": "~/workspace/lark-bridge",
     "additionalDirectories": [],
     "allowAllDirectories": false,
     "permissionMode": "plan"
+  },
+  "codex": {
+    "model": "gpt-5-codex"
   },
   "session": {
     "idleTimeoutMs": 1800000,
@@ -21,16 +25,8 @@
     "autoStart": false
   },
   "hooks": {
-    "session": {
-      "pre": [],
-      "post": [
-        { "type": "aria-memory-wrapup" }
-      ]
-    },
-    "message": {
-      "pre": [],
-      "post": []
-    }
+    "session": { "pre": [], "post": [] },
+    "message": { "pre": [], "post": [] }
   },
   "log": {
     "level": "info"
