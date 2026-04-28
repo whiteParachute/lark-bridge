@@ -42,9 +42,17 @@ Then ask about access control:
    - **Allow specific chats** — enter comma-separated chat_ids
    - **Allow all** — no restrictions (show warning: all Feishu users can interact)
 
-## Step 2: Claude Settings
+## Step 2: Backend Settings
 
-Ask the user to choose:
+### 2a. Default backend
+
+Ask:
+
+1. **默认后端** — 哪个 LLM 后端为新 chat 的默认值（用户可在飞书侧用 `/provider <claude|codex>` 随时切换）：
+   - `claude` (Recommended) — Claude Code via `@anthropic-ai/claude-agent-sdk`
+   - `codex` — OpenAI Codex via `@openai/codex-sdk`（需要预先 `codex login` 或设置 `CODEX_API_KEY`）
+
+### 2b. Claude backend settings
 
 1. **Claude model** — present options:
    - `sonnet` (Recommended) — balanced speed and capability
@@ -56,9 +64,15 @@ Ask the user to choose:
    - `bypassPermissions` — fully autonomous (show warning)
    - `default` — standard Claude Code permissions
 
-3. **Workspace root** — text input with default `~/workspace/lark-bridge`. This is where per-chat working directories are created.
+3. **Workspace root** — text input with default `~/workspace/lark-bridge`. This is where per-chat working directories are created. **Codex sessions share the same workspace** —— per-chat 子目录由两个后端共用。
 
 4. **Additional directories** — text input, comma-separated paths. Empty to skip.
+
+### 2c. Codex backend settings (only if codex was selected as default OR user wants to use it later)
+
+1. **Codex model** — text input with default `gpt-5-codex`. 留空使用 SDK 默认。
+
+提示用户：codex 鉴权不在配置文件里设置——需要在 host 上预先运行 `codex login` 完成 OAuth，或导出 `CODEX_API_KEY` 环境变量。
 
 ## Step 3: Session Settings
 
@@ -91,26 +105,26 @@ Ask the user to choose:
 
 ### 5a. aria-memory Integration
 
-Ask the user:
+Ask:
 
-1. **Enable aria-memory integration?** — present options:
-   - **No** (Default) — no memory persistence, pure Feishu↔Claude bridge
-   - **Yes, vanilla** — export session transcripts only. aria-memory plugin's own hooks handle the rest. Good for standard aria-memory setups.
-   - **Yes, custom** — full integration: transcript export + meta.json pendingWrapups + daemon-side GlobalSleepScheduler + PendingWrapupConsumer. Requires a custom aria-memory vault with meta.json support.
+1. **你机器上是否安装了 aria-memory？**（claude 或 codex 形态任一）—— 选项：
+   - **No**（默认）—— 没装，或装了但不想集成。lark-bridge 跑成纯 feishu↔LLM bridge，不碰 aria-memory。
+   - **Yes** —— 装了想集成。每次 feishu 会话关闭时把真 SDK transcript 路径登记到 `~/.aria-memory/meta.json.pendingWrapups`，**primary host 上的 claude/codex CLI 启动时自动 drain**（lark-bridge 不处理 wrapup/sleep 本身）。
 
-2. If **Yes (vanilla or custom)** selected, ask:
-   - **Memory directory** — text input with default `~/.aria-memory`. Where the aria-memory vault lives.
+2. 如果选 **Yes**，再问：
+   - **Memory directory** —— 默认 `~/.aria-memory`，按需修改（aria-memory vault 的位置）。
 
 Config mapping:
-- **No** → `"ariaMemory": { "enabled": false }` — no `hooks.session.post` injection
-- **Yes, vanilla** → `"ariaMemory": { "enabled": true, "variant": "vanilla", "memoryDir": "<path>" }` — auto-injects `aria-memory-wrapup` hook
-- **Yes, custom** → `"ariaMemory": { "enabled": true, "variant": "custom", "memoryDir": "<path>" }` — auto-injects hook + enables globalSleep + wrapupConsumer
+- **No** → `hooks.session.post: []`，不写 `ariaMemory` 块（用默认 `~/.aria-memory`）。
+- **Yes** → `hooks.session.post: [{ "type": "aria-memory-wrapup" }]`；如自定义 vault 路径再加 `"ariaMemory": { "memoryDir": "<path>" }`。
+
+> 旧版本支持的 `ariaMemory.enabled` / `ariaMemory.variant` / `globalSleep.*` / `wrapupConsumer.*` 字段已**废弃**，写在配置里也会被忽略（启动时打一行 warn）。daemon-side schedulers 已移除，sleep 由 primary CLI 处理。
 
 ### 5b. Custom Hooks
 
-2. **Add custom hooks?** — present options:
-   - **No** (Recommended) — use defaults (auto-injected based on aria-memory selection above)
-   - **Yes** — ask for shell command to run (and which phase: session.pre / session.post / message.pre / message.post)
+**Add custom hooks?** —— 选项：
+   - **No**（推荐）—— 仅按 5a 选择的 aria-memory hook
+   - **Yes** —— 让用户提供 shell 命令 + 触发阶段（session.pre / session.post / message.pre / message.post）。命令通过环境变量拿到上下文（HOOK_PHASE / HOOK_CHAT_ID / HOOK_BACKEND / HOOK_SESSION_ID 等）。
 
 ## Step 6: Write Configuration
 
