@@ -114,6 +114,25 @@ export class ProgressCardController {
     return this.state === 'active' || this.state === 'creating';
   }
 
+  /**
+   * 当前进度状态快照，供 `/state` 命令读取（无副作用，不触发卡片更新）。
+   * 返回正在执行的工具名（如有）和最近一段 thinking 文本（截断到 200 字）。
+   */
+  getSnapshot(): {
+    activeTools: string[];
+    completedTools: string[];
+    thinking: string;
+  } {
+    return {
+      activeTools: this.tools.filter((t) => !t.completed).map((t) => t.name),
+      completedTools: this.tools.filter((t) => t.completed).map((t) => t.name),
+      thinking:
+        this.thinkingText.length > 200
+          ? '…' + this.thinkingText.slice(-197)
+          : this.thinkingText,
+    };
+  }
+
   feedThinking(text: string): void {
     this.thinkingText = text;
     this.markDirty();
