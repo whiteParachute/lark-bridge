@@ -1,9 +1,13 @@
 /**
- * Claude Agent SDK wrapper.
+ * Claude Agent SDK 后端实现。
  *
- * Adapted from HappyClaw's claude-session.ts — simplified for single-user
- * bridge use. Relies on settingSources: ['project', 'user'] to load all
- * plugins (including aria-memory) automatically.
+ * 内容自原 service/src/claude-bridge.ts 平移而来；仅把 `ClaudeBridge` 重命名
+ * 为 `ClaudeBackend` 并实现 Backend 接口（接口形态本来就一致，无逻辑改动）。
+ *
+ * 依赖 `settingSources: ['project', 'user']` 让安装的 Claude Code 插件
+ * （特别是 aria-memory）自动加载。`canUseTool` 永远 allow —— bridge 模式
+ * 没有人工审批通道；不实现这个 callback 的话 SDK 会卡在权限请求上，导致
+ * 整个 turn 异常终止。
  */
 
 import {
@@ -11,7 +15,8 @@ import {
   type Query,
   type SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
-import { logger } from './logger.js';
+import { logger } from '../logger.js';
+import type { Backend, BackendStartOptions, StreamMessage } from './index.js';
 
 // ─── Message Stream ──────────────────────────────────────────
 
@@ -82,47 +87,19 @@ class MessageStream {
   }
 }
 
-// ─── Stream Message Types ────────────────────────────────────
+// ─── Claude Backend ───────────────────────────────────────────
 
-export interface StreamMessage {
-  type:
-    | 'text_delta'
-    | 'thinking_delta'
-    | 'tool_use_start'
-    | 'tool_use_end'
-    | 'turn_complete'
-    | 'session_init'
-    | 'error';
-  text?: string;
-  sessionId?: string;
-  error?: string;
-  toolName?: string;
-  toolUseId?: string;
-  isError?: boolean;
-  turnId?: number;
-}
-
-// ─── Claude Bridge ───────────────────────────────────────────
-
-export interface ClaudeBridgeOptions {
-  model: string;
-  cwd: string;
-  additionalDirectories?: string[];
-  sessionId?: string;
-  permissionMode?: string;
-}
-
-export class ClaudeBridge {
+export class ClaudeBackend implements Backend {
   private stream: MessageStream | null = null;
   private queryRef: Query | null = null;
   private outputLoop: Promise<void> | null = null;
   private accumulatedText = '';
   private accumulatedThinking = '';
-  private activeToolBlocks = new Map<number, string>(); // index → toolName
+  private activeToolBlocks = new Map<number, string>();
   private currentTurnId = 0;
 
   start(
-    opts: ClaudeBridgeOptions,
+    opts: BackendStartOptions,
     onMessage: (msg: StreamMessage) => void,
   ): void {
     this.stream = new MessageStream();
@@ -149,9 +126,6 @@ export class ClaudeBridge {
               : {}),
             settingSources: ['project', 'user'],
             includePartialMessages: true,
-            // Auto-approve tool use — no interactive terminal in bridge mode.
-            // Without this callback, SDK cannot relay permission prompts and
-            // the turn terminates abnormally, causing context loss.
             canUseTool: async (toolName, input, callOpts) => {
               logger.info({ toolName }, 'Auto-approving tool use in bridge mode');
               return {
@@ -182,7 +156,6 @@ export class ClaudeBridge {
     message: any,
     onMessage: (msg: StreamMessage) => void,
   ): void {
-    // Stamp turnId on all emitted messages
     const turnId = this.currentTurnId;
     const emit = (msg: StreamMessage) => onMessage({ ...msg, turnId });
 
@@ -195,7 +168,6 @@ export class ClaudeBridge {
     }
 
     if (message.type === 'assistant') {
-      // Complete assistant message — extract final text
       const content = message.message?.content;
       if (Array.isArray(content)) {
         for (const block of content) {
@@ -211,7 +183,6 @@ export class ClaudeBridge {
       const event = message.event;
       if (!event) return;
 
-      // Thinking
       if (
         event.type === 'content_block_delta' &&
         event.delta?.type === 'thinking_delta'
@@ -224,13 +195,12 @@ export class ClaudeBridge {
         return;
       }
 
-      // Text output
       if (
         event.type === 'content_block_delta' &&
         event.delta?.type === 'text_delta'
       ) {
         this.accumulatedText += event.delta.text || '';
-        this.accumulatedThinking = ''; // Clear thinking when text starts
+        this.accumulatedThinking = '';
         emit({
           type: 'text_delta',
           text: this.accumulatedText,
@@ -238,7 +208,6 @@ export class ClaudeBridge {
         return;
       }
 
-      // Tool use start
       if (event.type === 'content_block_start') {
         const block = event.content_block;
         if (block?.type === 'tool_use') {
@@ -252,7 +221,6 @@ export class ClaudeBridge {
         return;
       }
 
-      // Tool use end (content_block_stop)
       if (event.type === 'content_block_stop') {
         const toolName = this.activeToolBlocks.get(event.index);
         if (toolName) {
@@ -282,7 +250,6 @@ export class ClaudeBridge {
         error: errorMsg,
       });
 
-      // Reset for next turn
       this.accumulatedText = '';
       this.accumulatedThinking = '';
       this.activeToolBlocks.clear();
@@ -294,7 +261,7 @@ export class ClaudeBridge {
     text: string,
     images?: Array<{ data: string; mimeType: string }>,
   ): void {
-    if (!this.stream) throw new Error('ClaudeBridge not started');
+    if (!this.stream) throw new Error('ClaudeBackend not started');
     this.stream.push(text, images);
   }
 

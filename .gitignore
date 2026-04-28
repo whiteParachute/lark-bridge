@@ -3,3 +3,4 @@ dist/
 *.js.map
 service/dist/
 service/node_modules/
+.omx/

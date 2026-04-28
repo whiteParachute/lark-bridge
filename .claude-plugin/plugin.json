@@ -1,7 +1,7 @@
 {
   "name": "lark-bridge",
   "version": "0.1.0",
-  "description": "Bridge Feishu (飞书) conversations to Claude Code sessions with aria-memory integration, session lifecycle management, and streaming card output.",
+  "description": "Bridge Feishu (飞书) conversations to Claude Code or Codex sessions. Supports per-chat backend switching via /provider, manual session reset (/new), session hold (/hold), and live state inspection (/state). Streaming card output, aria-memory integration, session lifecycle management.",
   "author": {
     "name": "whiteParachute"
   },
