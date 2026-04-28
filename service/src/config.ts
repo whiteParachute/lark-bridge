@@ -36,31 +36,25 @@ const HooksSchema = z
 
 const ConfigSchema = z.object({
   /**
-   * aria-memory integration toggle. When enabled, lark-bridge will:
-   *   - Export session transcripts to memoryDir/transcripts/
-   *   - Register pending wrapups in memoryDir/meta.json
-   *   - Run GlobalSleepScheduler and PendingWrapupConsumer
-   *   - Auto-inject aria-memory-wrapup hook into session.post (if hooks not explicitly set)
+   * aria-memory 集成的最小必需配置 —— 仅 vault 路径。
    *
-   * When disabled (default), none of the above runs — lark-bridge operates as
-   * a pure Feishu↔Claude bridge with no memory persistence.
+   * 是否集成由 `hooks.session.post` 是否包含 `{ type: 'aria-memory-wrapup' }`
+   * 决定，不再用单独的开关。后者出现 = opt-in，daemon 在每次 feishu 会话
+   * 关闭时把真实 SDK transcript 路径登记到 `<memoryDir>/meta.json.pendingWrapups`。
+   *
+   * 实际的 wrapup 处理 + global_sleep 由 primary host 上的 claude/codex CLI
+   * 启动时的 aria-memory SessionStart hook 负责，daemon 这边不做。
+   *
+   * 如果 vault 目录不存在，wrapup hook 会静默 skip（debug log），不打扰用户。
    */
+  // 兼容旧 schema：用 looseObject 吃掉 `enabled` / `variant` 等已废弃字段
+  // 而不报错（已废弃字段在 warnDeprecatedFields 里 console.warn 一次）。
   ariaMemory: z
-    .object({
-      enabled: z.boolean().default(false),
-      /**
-       * Integration variant:
-       *   - "vanilla": Export transcripts only. No meta.json, no daemon schedulers.
-       *     Relies on aria-memory plugin's own hooks for processing.
-       *   - "custom": Full integration — transcript export + meta.json pendingWrapups
-       *     registration + GlobalSleepScheduler + PendingWrapupConsumer.
-       *     Requires the custom aria-memory vault with meta.json support.
-       */
-      variant: z.enum(['vanilla', 'custom']).default('vanilla'),
+    .looseObject({
       /** Path to the aria-memory vault directory. Default: ~/.aria-memory */
       memoryDir: z.string().default('~/.aria-memory'),
     })
-    .default({ enabled: false, variant: 'vanilla', memoryDir: '~/.aria-memory' }),
+    .default({ memoryDir: '~/.aria-memory' }),
   feishu: z.object({
     appId: z.string().min(1),
     appSecret: z.string().min(1),
@@ -69,6 +63,11 @@ const ConfigSchema = z.object({
     /** Allowed chat_ids. Empty = allow all (DANGEROUS). */
     allowedChats: z.array(z.string()).default([]),
   }),
+  /**
+   * 全局默认后端。新 chat（未在 chat-state.json 持久化过）使用此后端。
+   * `/provider <kind>` 切换后会写到 chat-state.json，每个 chat 独立持久。
+   */
+  defaultBackend: z.enum(['claude', 'codex']).default('claude'),
   claude: z
     .object({
       model: z.string().default('sonnet'),
@@ -88,6 +87,18 @@ const ConfigSchema = z.object({
       allowAllDirectories: false,
       permissionMode: 'plan',
     }),
+  /**
+   * Codex 后端配置。workspaceRoot 复用 `claude.workspaceRoot`（两个后端共享
+   * 每 chat 的工作目录），故此处只需 codex 特有字段。
+   * 鉴权：通过 codex CLI 自身的会话状态（`codex login` 或 CODEX_API_KEY 环境
+   * 变量）传递，不在 lark-bridge 配置里管理。
+   */
+  codex: z
+    .object({
+      /** Codex 模型名（如 'gpt-5-codex'）；省略则使用 codex SDK 默认值。 */
+      model: z.string().optional(),
+    })
+    .default({}),
   session: z
     .object({
       idleTimeoutMs: z.number().default(30 * 60 * 1000),
@@ -96,69 +107,6 @@ const ConfigSchema = z.object({
     .default({
       idleTimeoutMs: 30 * 60 * 1000,
       maxDurationMs: 4 * 60 * 60 * 1000,
-    }),
-  globalSleep: z
-    .object({
-      /** Whether to enable the global_sleep scheduler. Default: false (auto-enabled when ariaMemory.enabled=true). */
-      enabled: z.boolean().optional(),
-      /** How often to check conditions, in ms. Default: 30 minutes. Min: 1 minute. */
-      checkIntervalMs: z.number().min(60_000).default(30 * 60 * 1000),
-      /**
-       * Minimum time between global_sleep runs, in ms. Default: 6 hours.
-       * Min: 1 hour. This is the floor — sleep never fires more often than
-       * this regardless of new work.
-       */
-      cooldownMs: z.number().min(3_600_000).default(6 * 60 * 60 * 1000),
-      /**
-       * Strong-trigger heuristic: fire when at least this many new impression
-       * files exist in ~/.aria-memory/impressions/ since the last successful
-       * sleep (mtime > lastGlobalSleepAt). Default 2, mirrors aria-memory's
-       * own SessionStart hook recommendation.
-       */
-      minNewImpressions: z.number().min(1).default(2),
-      /**
-       * Strong-trigger heuristic: fire when this much wall-clock time has
-       * passed since the last successful sleep, regardless of new work
-       * count. Default 12 hours, mirrors aria-memory's SessionStart hook.
-       * Min: 1 hour (must be >= cooldownMs to be meaningful).
-       */
-      staleAfterMs: z.number().min(3_600_000).default(12 * 60 * 60 * 1000),
-    })
-    .default({
-      checkIntervalMs: 30 * 60 * 1000,
-      cooldownMs: 6 * 60 * 60 * 1000,
-      minNewImpressions: 2,
-      staleAfterMs: 12 * 60 * 60 * 1000,
-    }),
-  wrapupConsumer: z
-    .object({
-      /** Whether to enable the pending wrapup consumer scheduler. Default: false (auto-enabled when ariaMemory.enabled=true). */
-      enabled: z.boolean().optional(),
-      /** How often to check conditions, in ms. Default: 30 minutes. Min: 1 minute. */
-      checkIntervalMs: z.number().min(60_000).default(30 * 60 * 1000),
-      /** Minimum time between successful wrapup runs, in ms. Default: 1 hour. Min: 5 minutes. */
-      cooldownMs: z.number().min(300_000).default(60 * 60 * 1000),
-      /**
-       * Primary trigger: fire when pendingWrapups.length >= this. Also
-       * doubles as the threshold at which global_sleep defers to wrapup
-       * (so the queue drains before the heavier sleep pass runs). Default 5
-       * — high enough to amortize per-invocation claude startup cost.
-       */
-      pendingThreshold: z.number().min(1).default(5),
-      /**
-       * Age-based fallback: even if pending is below pendingThreshold,
-       * fire when the oldest pending entry has been waiting longer than
-       * this. Without this, a steady-state of 1-4 pending would never get
-       * drained until the queue piled up. Default 6h, mirrors the
-       * global_sleep cooldown. Min 1h.
-       */
-      pendingMaxAgeMs: z.number().min(3_600_000).default(6 * 60 * 60 * 1000),
-    })
-    .default({
-      checkIntervalMs: 30 * 60 * 1000,
-      cooldownMs: 60 * 60 * 1000,
-      pendingThreshold: 5,
-      pendingMaxAgeMs: 6 * 60 * 60 * 1000,
     }),
   wsWatchdog: z
     .object({
@@ -217,6 +165,29 @@ function getConfigPath(): string {
   );
 }
 
+const DEPRECATED_TOP_LEVEL = ['globalSleep', 'wrapupConsumer'] as const;
+const DEPRECATED_ARIA_FIELDS = ['enabled', 'variant'] as const;
+
+function warnDeprecatedFields(raw: any): void {
+  if (!raw || typeof raw !== 'object') return;
+  const found: string[] = [];
+  for (const key of DEPRECATED_TOP_LEVEL) {
+    if (key in raw) found.push(key);
+  }
+  if (raw.ariaMemory && typeof raw.ariaMemory === 'object') {
+    for (const key of DEPRECATED_ARIA_FIELDS) {
+      if (key in raw.ariaMemory) found.push(`ariaMemory.${key}`);
+    }
+  }
+  if (found.length > 0) {
+    console.warn(
+      `⚠️  Deprecated config fields ignored: ${found.join(', ')}. ` +
+        'aria-memory daemon-side schedulers are removed; primary host CLI handles drain. ' +
+        'Add `{ "type": "aria-memory-wrapup" }` to hooks.session.post to opt-in.',
+    );
+  }
+}
+
 function parseConfig(configPath: string): BridgeConfig {
   if (!existsSync(configPath)) {
     throw new Error(
@@ -225,6 +196,7 @@ function parseConfig(configPath: string): BridgeConfig {
   }
 
   const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+  warnDeprecatedFields(raw);
   const config = ConfigSchema.parse(raw);
 
   // Warn if no allowlist configured
@@ -251,52 +223,6 @@ function parseConfig(configPath: string): BridgeConfig {
 
   // Expand ariaMemory.memoryDir
   config.ariaMemory.memoryDir = expandHome(config.ariaMemory.memoryDir);
-
-  // ── aria-memory auto-wiring ──
-  //
-  // Three modes:
-  //   1. disabled (enabled=false): no memory, no hooks, no schedulers
-  //   2. vanilla  (enabled=true, variant="vanilla"): transcript export only,
-  //      no meta.json manipulation, no daemon schedulers
-  //   3. custom   (enabled=true, variant="custom"): full integration with
-  //      meta.json pendingWrapups + GlobalSleepScheduler + PendingWrapupConsumer
-  //
-  if (config.ariaMemory.enabled) {
-    // Auto-inject aria-memory-wrapup hook into session.post if not
-    // explicitly configured by the user.
-    const hasWrapupHook = config.hooks.session.post.some(
-      (h) => h.type === 'aria-memory-wrapup',
-    );
-    if (!hasWrapupHook && !raw.hooks?.session?.post) {
-      config.hooks.session.post.push({ type: 'aria-memory-wrapup' });
-    }
-
-    if (config.ariaMemory.variant === 'custom') {
-      // Custom mode: auto-enable schedulers unless explicitly disabled
-      if (config.globalSleep.enabled === undefined) {
-        (config.globalSleep as any).enabled = true;
-      }
-      if (config.wrapupConsumer.enabled === undefined) {
-        (config.wrapupConsumer as any).enabled = true;
-      }
-    } else {
-      // Vanilla mode: schedulers off (they need meta.json infrastructure)
-      if (config.globalSleep.enabled === undefined) {
-        (config.globalSleep as any).enabled = false;
-      }
-      if (config.wrapupConsumer.enabled === undefined) {
-        (config.wrapupConsumer as any).enabled = false;
-      }
-    }
-  } else {
-    // Disabled: force everything off
-    if (config.globalSleep.enabled === undefined) {
-      (config.globalSleep as any).enabled = false;
-    }
-    if (config.wrapupConsumer.enabled === undefined) {
-      (config.wrapupConsumer as any).enabled = false;
-    }
-  }
 
   return config;
 }

@@ -3,12 +3,16 @@
  *
  * Provides pre/post hooks for session and message lifecycle events.
  * Built-in hook types:
- *   - aria-memory-wrapup: exports transcript and registers pending wrapup
+ *   - aria-memory-wrapup: register the underlying SDK transcript path into
+ *     ~/.aria-memory/meta.json.pendingWrapups so primary host's claude/codex
+ *     CLI can drain it on next SessionStart. Backend-aware (claude vs codex).
  *   - command: runs a shell command with context as env vars
  */
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
-import { exportAndRegisterWrapup, type TranscriptEntry } from './memory-wrapup.js';
+import { registerPendingWrapup } from './memory-wrapup.js';
+import type { TranscriptEntry } from './memory-wrapup.js';
+import type { BackendKind } from './backend/index.js';
 import { logger } from './logger.js';
 
 const execAsync = promisify(exec);
@@ -44,7 +48,16 @@ export interface HooksConfig {
 export interface SessionHookContext {
   chatId: string;
   chatType: 'p2p' | 'group';
+  /**
+   * Backend SDK 的 session/thread id。claude 后端是 system/init 给出的
+   * sessionId（也是 ~/.claude/projects/<encoded>/<id>.jsonl 的文件名）；
+   * codex 后端是 thread.started 给出的 thread_id（state_*.sqlite 里查 rollout）。
+   */
   sessionId?: string;
+  /** 后端类型 —— wrapup hook 用它决定怎么解析 transcript 路径。 */
+  backendKind?: BackendKind;
+  /** Backend 启动时的 cwd —— claude 后端拿来拼 transcript 路径。 */
+  cwd?: string;
   transcript: TranscriptEntry[];
   reason?: string;
 }
@@ -63,21 +76,17 @@ async function runHook(
   hook: HookDef,
   phase: string,
   ctx: SessionHookContext | MessageHookContext,
-  ariaMemoryVariant?: 'vanilla' | 'custom',
 ): Promise<void> {
   switch (hook.type) {
     case 'aria-memory-wrapup': {
       const sessionCtx = ctx as SessionHookContext;
-      if (sessionCtx.transcript && sessionCtx.transcript.length > 0) {
-        // vanilla: export transcript only; custom: also register in meta.json
-        const registerPending = ariaMemoryVariant === 'custom';
-        await exportAndRegisterWrapup(
-          sessionCtx.chatId,
-          sessionCtx.chatType,
-          sessionCtx.transcript,
-          registerPending,
-        );
-      }
+      if (!sessionCtx.transcript || sessionCtx.transcript.length === 0) return;
+      await registerPendingWrapup({
+        chatId: sessionCtx.chatId,
+        backendKind: sessionCtx.backendKind ?? 'claude',
+        sessionId: sessionCtx.sessionId,
+        cwd: sessionCtx.cwd,
+      });
       break;
     }
 
@@ -96,6 +105,9 @@ async function runHook(
       }
       if ('sessionId' in ctx && ctx.sessionId) {
         env.HOOK_SESSION_ID = ctx.sessionId;
+      }
+      if ('backendKind' in ctx && ctx.backendKind) {
+        env.HOOK_BACKEND = ctx.backendKind;
       }
       if ('reason' in ctx && ctx.reason) {
         env.HOOK_REASON = ctx.reason;
@@ -126,19 +138,15 @@ async function runHook(
 
 /**
  * Run a list of hooks sequentially.
- *
- * @param ariaMemoryVariant - Passed through to aria-memory-wrapup hooks
- *   to control whether meta.json registration happens.
  */
 export async function runHooks(
   hooks: HookDef[],
   phase: string,
   ctx: SessionHookContext | MessageHookContext,
-  ariaMemoryVariant?: 'vanilla' | 'custom',
 ): Promise<void> {
   for (const hook of hooks) {
     try {
-      await runHook(hook, phase, ctx, ariaMemoryVariant);
+      await runHook(hook, phase, ctx);
     } catch (err) {
       logger.error({ err, phase, hookType: hook.type }, 'Hook execution failed');
       // Continue to next hook — one failure shouldn't block others
