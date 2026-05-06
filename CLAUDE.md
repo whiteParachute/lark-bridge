@@ -47,11 +47,11 @@ cd service && npm run dev        # tsc --watch
 5. `Session.backend` 是 `Backend` 接口实例，由 `createBackend(kind)` 工厂产出（`backend/index.ts`）。三种实现：
    - `ClaudeBackend` (`backend/claude.ts`) — 封装 `@anthropic-ai/claude-agent-sdk` 的 `query()`。`settingSources: ['project','user']` 让安装的插件（aria-memory）自动加载。`canUseTool` 始终 allow —— bridge 模式没有交互终端。
    - `CodexBackend` (`backend/codex.ts`) — 封装 `@openai/codex-sdk` 的 `Thread.runStreamed()`。事件粒度比 claude 粗（`item.completed` / `turn.completed`），适配为统一 `StreamMessage` 时只能产出粗粒度 `text_delta`，飞书"打字机"流式效果会退化为整段一次到位 —— codex 协议层面的 trade-off，非 lark-bridge bug。
-   - `TmuxBackend` (`backend/tmux.ts`) — 不走 SDK；对已有或新建的 tmux pane 执行 `paste-buffer` + `send-keys Enter`，再轮询 `capture-pane`。关闭 bridge session 时不 kill tmux，支持电脑端和飞书端交替接管同一 codex/claude code session。
+   - `TmuxBackend` (`backend/tmux.ts`) — 不走 SDK；启动/attach 后先只读观察当前 pane 输出，飞书侧普通消息才执行 `paste-buffer` + `send-keys Enter`，再轮询 `capture-pane`。关闭 bridge session 时不 kill tmux，支持电脑端和飞书端交替接管同一 codex/claude code session。
 6. 后端流式事件分发到两类卡片：
    - `ProgressCardController` — 接 `thinking_delta` / `tool_use_start` / `tool_use_end`，`complete()` 后 15 秒自动删除。
-   - `StreamingCardController` — 接 `text_delta`，`turn_complete` 时定稿。卡片 patch 失败则降级为纯文本。
-7. 单 turn 归属由 `turnId` 跟踪（每个 `turn_complete` 后递增）。当新用户消息在 turn 中途到达时，`handleMessage` 会等待上一个 turn 的 `turnCompletePromise`（带 30 秒安全超时）后再切换卡片。这样可以避免 `turn_complete` 被错误归属到新卡片。
+   - `StreamingCardController` — 接 `text_delta`，`turn_complete` 时定稿；若后端只发 `turn_complete`，会直接创建最终卡片。卡片 patch 失败则降级为纯文本。
+7. 单 turn 归属由 `turnId` 跟踪（每个 `turn_complete` 后递增）。同一 session 的用户消息通过 `deliveryChain` 串行投递：先等上一 turn 完成，再写 transcript / 跑 message.pre hooks / 切换卡片 / push 到后端。直接 SDK 后端保留 30 秒安全超时；tmux 后端不会绕过等待，必须等观察轮或上一输入轮稳定后才 paste 新输入，避免多条飞书消息并发抢同一个 pane/card。
 8. 空闲计时器 (`session.idleTimeoutMs`) 和最长时长计时器 (`session.maxDurationMs`) 都调用 `closeSession`，依次 `interrupt()` → `end()` 后端 query，跑 `session.post` hooks，然后移除会话。**`session.held === true`（用户用了 `/hold`）时这两个计时器都不会安装** —— `resetIdleTimer` 直接 return，`createSession` 跳过 max timer。
 
 每个会话在创建时 `structuredClone` 一份配置 —— 后续热加载不影响在飞会话，只有下一条消息路径才看到新配置。
@@ -62,7 +62,7 @@ cd service && npm run dev        # tsc --watch
 - `Backend` 接口形态故意与原 `ClaudeBridge` 一一对应：`start / pushMessage / getTurnId / interrupt / end / waitForCompletion`。SessionManager 不需要知道底层是哪个 SDK。
 - `StreamMessage` 类型是事实上的统一协议；新后端的事件适配在自己的 backend 类里完成，外部代码不变。
 - Codex 后端的特殊点：(a) 图片输入暂未桥接（SDK 的 `Input` 联合类型只接受 `text` / `local_image`-by-path，不接 base64；pushMessage 收到 images 会丢弃并 warn，未来需要桥接时把 base64 落 tmp 文件再传 path）；(b) `interrupt()` 通过 `AbortController` + `TurnOptions.signal` 实现真正的中断；(c) 鉴权依赖 codex CLI 自身（`codex login` / `CODEX_API_KEY`），lark-bridge 配置文件不管；(d) `startThread` 默认 **YOLO**：`approvalPolicy: 'never'` + `sandboxMode: 'danger-full-access'` + `networkAccessEnabled: true`，与 claude 后端 `canUseTool: allow` 等价的"全放行"——可跑 systemctl/sudo、跨目录 git/npm。安全完全下沉到 `feishu.allowedSenders` / `feishu.allowedChats`，启动时白名单宽松会 warn（见 `index.ts`）。
-- Tmux 后端默认关闭，需显式设置 `tmux.enabled=true`。特殊点：(a) turn 完成靠 `settleDelayMs` 静默启发式，不等价于 SDK result；(b) `interrupt()` 故意 no-op，因为 `/provider`、`/tmux detach` 和 daemon 关停都会调用 closeSession，不能因此向用户的 tmux pane 发 `C-c`；(c) `/tmux new` 通过 `tmux.providerCommands` 的基础命令启动 `claude` 或 `codex` CLI，并自动追加与直接后端对齐的 `model` / `effort` / `permissionMode` / `cwd` / `add-dir` / codex YOLO 参数；(d) `/tmux kill <session>` 只允许关闭当前 chat 正在接管的 tmux session。
+- Tmux 后端默认关闭，需显式设置 `tmux.enabled=true`。特殊点：(a) turn 完成靠 `settleDelayMs` 静默启发式，不等价于 SDK result；(b) 每次 tmux session 启动会先跑只读观察轮，观察轮会显示到飞书但标记为 observation，不写 assistant transcript、不跑 message.post hooks；(c) 观察未完成时后续普通消息会按队列等待，避免把新输入 paste 到仍在执行的 pane；(d) `interrupt()` 故意 no-op，因为 `/provider`、`/tmux detach` 和 daemon 关停都会调用 closeSession，不能因此向用户的 tmux pane 发 `C-c`；(e) `/tmux new` 通过 `tmux.providerCommands` 的基础命令启动 `claude` 或 `codex` CLI，并自动追加与直接后端对齐的 `model` / `effort` / `permissionMode` / `cwd` / `add-dir` / codex YOLO 参数；(f) `/tmux kill <session>` 只允许关闭当前 chat 正在接管的 tmux session。
 
 ### Bot 命令体系
 
@@ -71,7 +71,7 @@ cd service && npm run dev        # tsc --watch
 - `deliverUserMessage` —— 旁路（仅 `commandResetSession` 用），把构造的 `continuationMsg` 直接送进会话路径，**跳过 allowlist / rate-limit / parseCommand**，避免无限递归。原 `/new`、`/provider` 触发消息已在 `handleMessage` 入口过 allowlist。
 - `/hold` —— 设 `session.held = true`，清掉两个 timer。`/release` 会恢复计时；会话被销毁时（`/new`、`/provider`、`/model`、daemon 关停）自然解除。
 - `/state` —— 纯本地读 Session 字段 + `progressCard.getSnapshot()`，**不调 LLM**，发独立简单卡片，不污染当前 turn 的 streaming card。
-- `/tmux` —— `new/attach` 会持久化 tmux target 并把 chat 默认后端设为 `tmux`；`detach` 只退出 bridge 接管，不关闭 tmux session；`list/capture/state` 都是本地 tmux 操作，不进入 LLM。
+- `/tmux` —— `new/attach` 会持久化 tmux target、把 chat 默认后端设为 `tmux`，并先把当前 pane 输出作为只读 observation 轮流式同步；`detach` 只退出 bridge 接管，不关闭 tmux session；`list/capture/state` 都是本地 tmux 操作，不进入 LLM。
 
 ### 持久化默认后端
 

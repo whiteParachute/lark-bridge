@@ -89,12 +89,12 @@ Ask whether to enable tmux handoff:
 
 1. **tmux 接管** — 选项：
    - **Disable**（默认）—— 不启用 tmux 后端，避免把 host 上 tmux pane 的输入/输出权限暴露给飞书侧
-   - **Enable** —— 支持飞书侧 `/tmux new|attach|detach|ls|list|capture|state`
+   - **Enable** —— 支持飞书侧 `/tmux new|attach|detach|ls|list|capture|state`；`new/attach` 会先只读观察当前 pane 输出，观察稳定后才按队列允许后续普通消息 paste 到同一个 pane；观察轮不写 assistant transcript、不触发 message.post hooks
 
 2. If enabled, ask:
    - **Default tmux provider** — `codex`（推荐）或 `claude`，用于 `/tmux new <session>` 未显式指定 provider 时
    - **Provider commands** — 默认 `claude` / `codex`。这里只配置基础命令或包装脚本名；lark-bridge 会自动追加与直接后端对齐的 model / permission / cwd / add-dir / codex YOLO 参数。
-   - **Capture settle delay** — 默认 15000ms。说明：tmux 后端无法知道 CLI 真正 turn_complete，只能在 pane 输出静默一段时间后认为本轮完成。
+   - **Capture settle delay** — 默认 15000ms。说明：tmux 后端无法知道 CLI 真正 turn_complete，只能在 pane 输出静默一段时间后认为观察轮或输入轮完成；等待期间后续消息会排队。
 
 ## Step 3: Session Settings
 
