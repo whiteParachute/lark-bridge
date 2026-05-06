@@ -60,13 +60,13 @@ cd service && npm run dev        # tsc --watch
 - `service/src/backend/index.ts` 定义 `Backend` 接口、`BackendKind` 枚举（`'claude' | 'codex'`）、`StreamMessage` 协议、`createBackend(kind)` 工厂。
 - `Backend` 接口形态故意与原 `ClaudeBridge` 一一对应：`start / pushMessage / getTurnId / interrupt / end / waitForCompletion`。SessionManager 不需要知道底层是哪个 SDK。
 - `StreamMessage` 类型是事实上的统一协议；新后端的事件适配在自己的 backend 类里完成，外部代码不变。
-- Codex 后端的特殊点：(a) 图片输入暂未桥接（SDK 的 `Input` 联合类型只接受 `text` / `local_image`-by-path，不接 base64；pushMessage 收到 images 会丢弃并 warn，未来需要桥接时把 base64 落 tmp 文件再传 path）；(b) `interrupt()` 通过 `AbortController` + `TurnOptions.signal` 实现真正的中断；(c) 鉴权依赖 codex CLI 自身（`codex login` / `CODEX_API_KEY`），lark-bridge 配置文件不管；(d) `startThread` 默认 `approvalPolicy: 'never'` + `sandboxMode: 'workspace-write'` + `networkAccessEnabled: true` —— bridge 模式无人值守 + 经常需要 git/curl，三件套配齐。
+- Codex 后端的特殊点：(a) 图片输入暂未桥接（SDK 的 `Input` 联合类型只接受 `text` / `local_image`-by-path，不接 base64；pushMessage 收到 images 会丢弃并 warn，未来需要桥接时把 base64 落 tmp 文件再传 path）；(b) `interrupt()` 通过 `AbortController` + `TurnOptions.signal` 实现真正的中断；(c) 鉴权依赖 codex CLI 自身（`codex login` / `CODEX_API_KEY`），lark-bridge 配置文件不管；(d) `startThread` 默认 **YOLO**：`approvalPolicy: 'never'` + `sandboxMode: 'danger-full-access'` + `networkAccessEnabled: true`，与 claude 后端 `canUseTool: allow` 等价的"全放行"——可跑 systemctl/sudo、跨目录 git/npm。安全完全下沉到 `feishu.allowedSenders` / `feishu.allowedChats`，启动时白名单宽松会 warn（见 `index.ts`）。
 
 ### Bot 命令体系
 
 - `service/src/commands.ts` —— 解析消息文本。仅当首行首词命中白名单 `{new, provider, hold, state}` 时返回 `BotCommand`，否则返回 null（透传给后端）。这样保留了 Claude Code 自身的 `/init`、`/review` 这些 slash command。
 - `SessionManager.handleCommand` —— dispatch。`/new` 与 `/provider` 都走 `commandResetSession` 公共路径：关闭当前会话 → 用指定后端开新会话 → 可选 inline prompt 作为首条消息。`/provider` 还会持久化默认后端到 `chat-state.json`。
-- `dispatchPlainMessage` —— 旁路（仅 `commandResetSession` 用），把 inline prompt 直接送进会话路径，**跳过 allowlist / rate-limit / parseCommand**，避免无限递归。
+- `deliverUserMessage` —— 旁路（仅 `commandResetSession` 用），把构造的 `continuationMsg` 直接送进会话路径，**跳过 allowlist / rate-limit / parseCommand**，避免无限递归。原 `/new`、`/provider` 触发消息已在 `handleMessage` 入口过 allowlist。
 - `/hold` —— 设 `session.held = true`，清掉两个 timer。仅在会话被销毁时（`/new`、`/provider`、daemon 关停）解除。
 - `/state` —— 纯本地读 Session 字段 + `progressCard.getSnapshot()`，**不调 LLM**，发独立简单卡片，不污染当前 turn 的 streaming card。
 

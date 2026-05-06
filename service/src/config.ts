@@ -75,17 +75,17 @@ const ConfigSchema = z.object({
       additionalDirectories: z.array(z.string()).default([]),
       /** Allow Claude to access all directories under $HOME. Default: false. */
       allowAllDirectories: z.boolean().default(false),
-      /** Permission mode for Claude sessions. Default: plan (safer). */
+      /** Permission mode for Claude sessions. Default: auto (workspace 内自动放行). */
       permissionMode: z
-        .enum(['bypassPermissions', 'plan', 'default'])
-        .default('plan'),
+        .enum(['bypassPermissions', 'plan', 'default', 'auto', 'acceptEdits'])
+        .default('auto'),
     })
     .default({
       model: 'sonnet',
       workspaceRoot: '~/workspace/lark-bridge',
       additionalDirectories: [],
       allowAllDirectories: false,
-      permissionMode: 'plan',
+      permissionMode: 'auto',
     }),
   /**
    * Codex 后端配置。workspaceRoot 复用 `claude.workspaceRoot`（两个后端共享

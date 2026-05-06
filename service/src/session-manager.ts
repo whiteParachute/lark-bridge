@@ -27,6 +27,7 @@ import { type FeishuClient, type FeishuMessage } from './feishu.js';
 import { type BridgeConfig, reloadConfig } from './config.js';
 import { type BotCommand, parseCommand } from './commands.js';
 import { ChatStateStore } from './chat-state.js';
+import { emitReloadWarningsIfWidened } from './allowlist-warnings.js';
 import { logger } from './logger.js';
 import * as lark from '@larksuiteoapi/node-sdk';
 
@@ -111,9 +112,12 @@ export class SessionManager {
   }
 
   async handleMessage(msg: FeishuMessage): Promise<void> {
-    // Hot-reload config so allowlist changes take effect without daemon restart
+    // Hot-reload config so allowlist changes take effect without daemon restart.
+    // 比较新旧 allowlist：变得更危险（允许更多人/群）就 warn 到日志——给运维一条
+    // 面包屑，能看出何时白名单被外部改宽（手动 / 误操作 / 被 agent 自我改写）。
     const freshConfig = reloadConfig();
     if (freshConfig) {
+      emitReloadWarningsIfWidened(this.config.feishu, freshConfig.feishu);
       this.config = freshConfig;
     }
 

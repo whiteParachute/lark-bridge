@@ -193,7 +193,7 @@ cp config/config.example.json ~/.lark-bridge/config.json
     "model": "sonnet",                // Claude 模型
     "workspaceRoot": "~/workspace/lark-bridge",  // 两个后端共用的 per-chat 工作目录根
     "additionalDirectories": [],
-    "permissionMode": "plan"          // bypassPermissions | plan | default
+    "permissionMode": "auto"          // auto (默认) | acceptEdits | plan | default | bypassPermissions
   },
   "codex": {
     "model": "gpt-5-codex"            // 可选；省略则用 codex SDK 默认
@@ -352,7 +352,7 @@ Daemon 在 session 和 message 生命周期提供 4 个 hook 插槽：
 | 流式粒度 | 字符级 `text_delta` + 工具进度 + thinking | item 级（agent_message / reasoning / 工具） |
 | 飞书"打字机"效果 | ✅ 平滑 | ⚠️ 整段一次到位（SDK 限制） |
 | 图片输入 | ✅ | ❌（SDK input 是 string） |
-| 工具自动批准 | `canUseTool` 回调（自动 allow） | `sandboxMode: workspace-write`（无回调） |
+| 工具自动批准 | `permissionMode: auto` + `canUseTool` 回调（永远 allow） | `approvalPolicy: never` + `sandboxMode: danger-full-access`（YOLO）|
 | 中断当前 turn | ✅ `query.interrupt()` | ✅ `AbortController.abort()`（via `TurnOptions.signal`） |
 | 加载 Claude Code 插件 | ✅ `settingSources: ['project','user']` | ❌ |
 

@@ -59,10 +59,12 @@ Ask:
    - `opus` — most capable, slower
    - `haiku` — fastest, lighter tasks
 
-2. **Permission mode** — present options:
-   - `plan` (Recommended) — Claude proposes actions, user approves
-   - `bypassPermissions` — fully autonomous (show warning)
-   - `default` — standard Claude Code permissions
+2. **Permission mode** — present options（提示用户：`canUseTool` 回调对所有工具永远 allow，所以不论选哪档 Claude 实际都能跑任意命令；这里更多是模型的行为风格选择）：
+   - `auto` (Recommended) — Claude 主动执行，与 codex 后端 YOLO（`approvalPolicy: never` + `sandboxMode: danger-full-access`）能力对等
+   - `acceptEdits` — 模型行为偏向自动接受编辑、其它先问（bridge 模式没人答，多数情况下也直接执行）
+   - `plan` — 模型仅提议方案不直接动手（bridge 模式没人按"确认"，会卡住，不建议）
+   - `bypassPermissions` — 显式跳过权限层（show warning）
+   - `default` — 标准 Claude Code 权限
 
 3. **Workspace root** — text input with default `~/workspace/lark-bridge`. This is where per-chat working directories are created. **Codex sessions share the same workspace** —— per-chat 子目录由两个后端共用。
 

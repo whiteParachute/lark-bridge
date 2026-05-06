@@ -120,7 +120,7 @@ export class ClaudeBackend implements Backend {
             cwd: opts.cwd,
             additionalDirectories: opts.additionalDirectories,
             ...(opts.sessionId ? { resume: opts.sessionId } : {}),
-            permissionMode: (opts.permissionMode || 'plan') as any,
+            permissionMode: (opts.permissionMode || 'auto') as any,
             ...(opts.permissionMode === 'bypassPermissions'
               ? { allowDangerouslySkipPermissions: true }
               : {}),

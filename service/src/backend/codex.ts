@@ -7,9 +7,12 @@
  * 与 claude-agent-sdk 的差异（已知 + 设计取舍）：
  * - **无 prompt 流**：codex 是"每条 prompt 一次 run"模型；本实现维护一个
  *   prompt 队列，由内部 output loop 顺序消费。
- * - **审批走 policy 而非回调**：bridge 模式无人值守，固定 `approvalPolicy: 'never'`
- *   + `sandboxMode: 'workspace-write'` —— 全部命令自动放行，但 codex 仍受沙箱
- *   保护无法越出 cwd。
+ * - **审批走 policy 而非回调（YOLO）**：bridge 模式无人值守，固定
+ *   `approvalPolicy: 'never'` + `sandboxMode: 'danger-full-access'` —— 与 claude
+ *   后端 `canUseTool: allow` 等价的"全放行"配置。codex 可执行任意命令，包括
+ *   `systemctl` / `sudo`、跨目录 git/npm、改 `~/anywhere`。**安全责任完全下沉
+ *   到飞书侧 allowlist**（`feishu.allowedSenders` / `feishu.allowedChats`）。
+ *   启动时若白名单宽松会发 warn，见 index.ts。
  * - **图片输入**：SDK 0.125 起支持 `UserInput[]` 但只接 `local_image`（文件路径）。
  *   pushMessage 收到 base64 images 时丢弃并 warn，等需要时再写 tmp 文件支持。
  * - **无 `interrupt()`** 的对等实现：SDK 提供 `AbortSignal` 走 TurnOptions.signal，
@@ -56,9 +59,9 @@ export class CodexBackend implements Backend {
       workingDirectory: opts.cwd,
       // 跳过 git 仓库检查 —— per-chat 工作目录可能不是 git repo
       skipGitRepoCheck: true,
-      // bridge 模式下需要写文件能力（codex 安装在 cwd 内，不会逃出沙箱）
-      sandboxMode: 'workspace-write',
-      // 无人值守模式：所有命令自动放行
+      // YOLO：与 claude 后端的 `canUseTool: allow` 对齐——codex 可执行任意命令、
+      // 跨任意目录读写、systemctl/sudo 不拦。安全责任由 feishu allowlist 承担。
+      sandboxMode: 'danger-full-access',
       approvalPolicy: 'never',
       // 默认放开网络访问 —— bridge 是无人值守代理，agent 经常需要 git pull/push
       // (aria-memory vault 的远端同步)、curl、ping API 等。Codex sandbox 默认

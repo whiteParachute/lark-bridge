@@ -11,7 +11,7 @@
     "workspaceRoot": "~/workspace/lark-bridge",
     "additionalDirectories": [],
     "allowAllDirectories": false,
-    "permissionMode": "plan"
+    "permissionMode": "auto"
   },
   "codex": {
     "model": "gpt-5-codex"

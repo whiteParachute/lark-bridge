@@ -13,6 +13,7 @@ import { logger, initLogger } from './logger.js';
 import { FeishuClient } from './feishu.js';
 import { SessionManager } from './session-manager.js';
 import { initMemoryPaths } from './meta-lock.js';
+import { emitStartupWarnings } from './allowlist-warnings.js';
 import { mkdirSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -33,6 +34,10 @@ async function main(): Promise<void> {
     },
     'Config loaded',
   );
+
+  // YOLO 模式安全告警：两个后端实际都能跑任意命令（claude canUseTool 永远 allow，
+  // codex sandbox=danger-full-access），所以宽松白名单等于把 host 当公开 shell。
+  emitStartupWarnings(config.feishu);
 
   // Ensure directories exist
   const bridgeDir = resolve(homedir(), '.lark-bridge');
