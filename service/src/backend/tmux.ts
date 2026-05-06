@@ -30,6 +30,7 @@ export class TmuxBackend implements Backend {
   private pollIntervalMs = 1000;
   private settleDelayMs = 6000;
   private turnTimeoutMs = 20 * 60 * 1000;
+  private observeOnStart = false;
   private outputLoop: Promise<void> | null = null;
   private done = false;
   private currentTurnId = 0;
@@ -49,6 +50,7 @@ export class TmuxBackend implements Backend {
     this.pollIntervalMs = opts.tmux.pollIntervalMs;
     this.settleDelayMs = opts.tmux.settleDelayMs;
     this.turnTimeoutMs = opts.tmux.turnTimeoutMs;
+    this.observeOnStart = opts.tmux.observeOnStart ?? false;
     this.done = false;
     this.currentTurnId = 0;
 
@@ -59,6 +61,9 @@ export class TmuxBackend implements Backend {
           type: 'session_init',
           sessionId: this.target,
         });
+        if (this.observeOnStart) {
+          await this.runObserveTurn(onMessage);
+        }
         await this.runLoop(onMessage);
       } catch (err: any) {
         logger.error({ err, target: this.target }, 'tmux backend failed');
@@ -147,6 +152,57 @@ export class TmuxBackend implements Backend {
       `已发送到 tmux \`${this.target}\`，${Math.round(
         this.settleDelayMs / 1000,
       )} 秒内暂无新输出。`;
+    emit({ type: 'turn_complete', text: finalText });
+    this.currentTurnId++;
+  }
+
+  private async runObserveTurn(
+    onMessage: (msg: StreamMessage) => void,
+  ): Promise<void> {
+    const turnId = this.currentTurnId;
+    const emit = (msg: StreamMessage) =>
+      onMessage({ ...msg, turnId, isObservation: true });
+
+    let latest = await captureTmuxTarget(this.target, this.captureLines).catch(
+      (err) => {
+        logger.debug({ err, target: this.target }, 'tmux initial capture failed');
+        return '';
+      },
+    );
+    let emitted = clipOutput(latest.trim());
+    let lastChangedAt = Date.now();
+    const deadline = Date.now() + this.turnTimeoutMs;
+
+    if (emitted) {
+      emit({ type: 'text_delta', text: emitted });
+    }
+
+    while (!this.done && Date.now() < deadline) {
+      await sleep(this.pollIntervalMs);
+      const nextCapture = await captureTmuxTarget(
+        this.target,
+        this.captureLines,
+      ).catch((err) => {
+        logger.debug({ err, target: this.target }, 'tmux observe capture failed');
+        return latest;
+      });
+
+      if (nextCapture !== latest) {
+        latest = nextCapture;
+        lastChangedAt = Date.now();
+        const nextText = clipOutput(latest.trim());
+        if (nextText && nextText !== emitted) {
+          emitted = nextText;
+          emit({ type: 'text_delta', text: emitted });
+        }
+      }
+
+      if (Date.now() - lastChangedAt >= this.settleDelayMs) break;
+    }
+
+    const finalText =
+      emitted ||
+      `已接管 tmux \`${this.target}\`，当前 pane 没有可见输出。`;
     emit({ type: 'turn_complete', text: finalText });
     this.currentTurnId++;
   }

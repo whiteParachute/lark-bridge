@@ -25,6 +25,8 @@ export interface TmuxBackendOptions {
   pollIntervalMs: number;
   settleDelayMs: number;
   turnTimeoutMs: number;
+  /** Observe the existing pane output as an initial read-only turn before input. */
+  observeOnStart?: boolean;
 }
 
 export interface StreamMessage {
@@ -42,6 +44,8 @@ export interface StreamMessage {
   toolName?: string;
   toolUseId?: string;
   isError?: boolean;
+  /** True when a backend is reporting existing state rather than a user turn. */
+  isObservation?: boolean;
   turnId?: number;
 }
 

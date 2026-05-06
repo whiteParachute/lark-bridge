@@ -76,6 +76,8 @@ interface Session {
   /** Resolves when the current turn completes — used to sequence card ownership */
   turnCompleteResolve: (() => void) | null;
   turnCompletePromise: Promise<void> | null;
+  /** Serializes per-session delivery so queued Feishu messages cannot steal turn ownership. */
+  deliveryChain: Promise<void>;
   /** `/hold` 已应用：idle/max timer 进入暂停态，直到会话被销毁 */
   held: boolean;
 }
@@ -332,7 +334,26 @@ export class SessionManager {
       }
     }
 
-    await this.deliverUserMessage(session, msg);
+    await this.enqueueUserDelivery(session, msg);
+  }
+
+  private async enqueueUserDelivery(
+    session: Session,
+    msg: FeishuMessage,
+  ): Promise<void> {
+    const previous = session.deliveryChain.catch(() => {});
+    const current = previous.then(async () => {
+      if (this.isSessionClosingOrClosed(session)) return;
+      await this.deliverUserMessage(session, msg);
+    });
+    session.deliveryChain = current.catch((err) => {
+      logger.error({ err, chatId: session.chatId }, 'Queued message delivery failed');
+    });
+    await current;
+  }
+
+  private isSessionClosingOrClosed(session: Session): boolean {
+    return session.state === 'closing' || session.state === 'closed';
   }
 
   /**
@@ -365,7 +386,7 @@ export class SessionManager {
 
   /**
    * 把一条已经过 allowlist + rate-limit + 命令解析的用户消息真正投递给后端：
-   * 文件下载 → transcript 记账 → message.pre hooks → per-turn 卡片切换 →
+   * 文件下载 → 等待上一轮完成 → transcript 记账 → message.pre hooks → per-turn 卡片切换 →
    * ack reaction → backend.pushMessage。
    *
    * 公共路径，handleMessage 与 commandResetSession 的 inline-prompt 路径都用它。
@@ -376,6 +397,8 @@ export class SessionManager {
     msg: FeishuMessage,
   ): Promise<void> {
     const { chatId } = session;
+    if (this.isSessionClosingOrClosed(session)) return;
+
     session.lastActivityAt = Date.now();
     this.resetIdleTimer(session);
 
@@ -413,7 +436,29 @@ export class SessionManager {
       }
     }
 
-    // Record transcript (after file download so content is complete)
+    // ── Per-turn card management ──
+    // Wait for the previous turn to complete before taking card ownership,
+    // so turn_complete events are correctly attributed to the right card.
+    // tmux startup/attach observations are intentionally not bypassed by the
+    // 30s safety timeout: a new prompt must not be pasted into a pane while the
+    // previous CLI task is still visibly running.
+    if (session.turnCompletePromise) {
+      if (session.backendKind === 'tmux') {
+        await this.feishu.sendMessage(
+          chatId,
+          'tmux pane 正在同步上一轮输出；本条消息会在输出稳定后发送到同一个 pane。',
+        );
+        await session.turnCompletePromise;
+      } else {
+        await Promise.race([
+          session.turnCompletePromise,
+          new Promise((r) => setTimeout(r, 30_000)), // safety timeout
+        ]);
+      }
+    }
+    if (this.isSessionClosingOrClosed(session)) return;
+
+    // Record transcript (after file download and after this message is ready to send)
     session.transcript.push({
       role: 'user',
       content: msg.text,
@@ -421,7 +466,7 @@ export class SessionManager {
       imageCount: msg.images?.length,
     });
 
-    // Run message pre hooks (sees final message including file paths)
+    // Run message pre hooks as close as possible to the actual backend push.
     await runHooks(session.config.hooks.message.pre, 'message.pre', {
       chatId,
       chatType: session.chatType,
@@ -429,16 +474,7 @@ export class SessionManager {
       content: msg.text,
       imageCount: msg.images?.length,
     });
-
-    // ── Per-turn card management ──
-    // Wait for the previous turn to complete before taking card ownership,
-    // so turn_complete events are correctly attributed to the right card.
-    if (session.turnCompletePromise) {
-      await Promise.race([
-        session.turnCompletePromise,
-        new Promise((r) => setTimeout(r, 30_000)), // safety timeout
-      ]);
-    }
+    if (this.isSessionClosingOrClosed(session)) return;
 
     if (session.streamingCard?.isActive()) {
       await session.streamingCard.abort('新消息已到达');
@@ -446,25 +482,7 @@ export class SessionManager {
     if (session.progressCard.isActive()) {
       await session.progressCard.abort('新消息已到达');
     }
-    session.progressCard = new ProgressCardController(this.larkClient, chatId);
-
-    session.streamingCard = new StreamingCardController({
-      client: this.larkClient,
-      chatId,
-      onFallback: () => {
-        logger.info({ chatId }, 'Streaming card fallback triggered');
-        const text = session.streamingCard?.getAccumulatedText();
-        if (text) {
-          this.feishu.sendMessage(chatId, text).catch(() => {});
-        }
-      },
-    });
-    // Track which bridge turnId this card belongs to (now safe — previous turn is done)
-    session.turnId = session.backend.getTurnId();
-    // Create a promise that resolves when this turn completes
-    session.turnCompletePromise = new Promise((resolve) => {
-      session.turnCompleteResolve = resolve;
-    });
+    this.beginTurnCard(session);
 
     // Ack reaction: add "OnIt" emoji to user's message
     if (msg.messageId) {
@@ -479,9 +497,41 @@ export class SessionManager {
     try {
       session.backend.pushMessage(msg.text, msg.images);
     } catch (err) {
-      logger.error({ err, chatId }, 'Failed to push message to Claude');
+      logger.error({ err, chatId }, 'Failed to push message to backend');
+      this.resolveTurnCompletion(session);
+      session.streamingCard?.abort('发送消息失败').catch(() => {});
+      session.streamingCard = null;
+      session.progressCard.abort('发送消息失败').catch(() => {});
       await this.feishu.sendMessage(chatId, '发送消息失败，请重试。');
     }
+  }
+
+  private beginTurnCard(session: Session): void {
+    const { chatId } = session;
+    session.progressCard = new ProgressCardController(this.larkClient, chatId);
+    session.streamingCard = new StreamingCardController({
+      client: this.larkClient,
+      chatId,
+      onFallback: () => {
+        logger.info({ chatId }, 'Streaming card fallback triggered');
+        const text = session.streamingCard?.getAccumulatedText();
+        if (text) {
+          this.feishu.sendMessage(chatId, text).catch(() => {});
+        }
+      },
+    });
+    session.turnId = session.backend.getTurnId();
+    session.turnCompletePromise = new Promise((resolve) => {
+      session.turnCompleteResolve = resolve;
+    });
+  }
+
+  private resolveTurnCompletion(session: Session): void {
+    if (session.turnCompleteResolve) {
+      session.turnCompleteResolve();
+    }
+    session.turnCompleteResolve = null;
+    session.turnCompletePromise = null;
   }
 
   async closeAll(reason = '服务维护中'): Promise<void> {
@@ -584,6 +634,7 @@ export class SessionManager {
       ackReaction: null,
       turnCompleteResolve: null,
       turnCompletePromise: null,
+      deliveryChain: Promise.resolve(),
       held: false,
     };
 
@@ -650,6 +701,9 @@ export class SessionManager {
             };
     if (backendKind === 'tmux' && startOpts.tmux) {
       await ensureTmuxTargetReady(startOpts.tmux);
+      if (startOpts.tmux.observeOnStart) {
+        this.beginTurnCard(session);
+      }
     }
     backend.start(startOpts, (msg) => this.handleStreamMessage(session, msg));
 
@@ -713,6 +767,7 @@ export class SessionManager {
       pollIntervalMs: config.tmux.pollIntervalMs,
       settleDelayMs: config.tmux.settleDelayMs,
       turnTimeoutMs: config.tmux.turnTimeoutMs,
+      observeOnStart: true,
     };
   }
 
@@ -818,8 +873,9 @@ export class SessionManager {
           session.ackReaction = null;
         }
 
-        // Record transcript
-        if (finalText) {
+        // Record transcript. Observation turns only mirror existing tmux pane
+        // output, so they should not look like assistant replies to a user turn.
+        if (finalText && !msg.isObservation) {
           session.transcript.push({
             role: 'assistant',
             content: finalText,
@@ -855,7 +911,7 @@ export class SessionManager {
         }
 
         // Run message post hooks
-        if (finalText) {
+        if (finalText && !msg.isObservation) {
           runHooks(session.config.hooks.message.post, 'message.post', {
             chatId,
             chatType: session.chatType,
@@ -867,11 +923,7 @@ export class SessionManager {
         }
 
         // Signal turn completion so next message can safely take card ownership
-        if (session.turnCompleteResolve) {
-          session.turnCompleteResolve();
-          session.turnCompleteResolve = null;
-          session.turnCompletePromise = null;
-        }
+        this.resolveTurnCompletion(session);
 
         // Create fresh progress card for next turn.
         // Old card manages its own delete timer via complete() — don't reset it.
@@ -885,11 +937,7 @@ export class SessionManager {
           this.chatState.clearTmux(chatId);
         }
         // Signal turn completion on error too
-        if (session.turnCompleteResolve) {
-          session.turnCompleteResolve();
-          session.turnCompleteResolve = null;
-          session.turnCompletePromise = null;
-        }
+        this.resolveTurnCompletion(session);
         if (session.streamingCard?.isActive()) {
           session.streamingCard.abort(`错误: ${msg.error}`).catch(() => {});
           session.streamingCard = null;
@@ -970,6 +1018,7 @@ export class SessionManager {
     } catch (err) {
       logger.debug({ err, chatId: session.chatId }, 'end()/waitForCompletion() failed (best effort)');
     }
+    this.resolveTurnCompletion(session);
 
     // Clean up cards
     session.progressCard.dispose();
@@ -1166,7 +1215,7 @@ export class SessionManager {
       ...msg,
       text: inlinePrompt,
     };
-    await this.deliverUserMessage(session, continuationMsg);
+    await this.enqueueUserDelivery(session, continuationMsg);
   }
 
   private async commandHold(chatId: string): Promise<void> {
@@ -1209,10 +1258,11 @@ export class SessionManager {
         '`/hold` / `/release`：保持会话 / 恢复自动关闭',
         '`/state`：查看当前会话状态',
         `tmux：${this.config.tmux.enabled ? '已启用' : '已禁用（需在配置中开启）'}`,
-        '`/tmux new <session> [claude|codex] [cwd]`：新建或接管 tmux session',
-        '`/tmux attach <target>`：接管已有 tmux pane',
+        '`/tmux new <session> [claude|codex] [cwd]`：新建或接管 tmux session，先同步当前 pane 输出',
+        '`/tmux attach <target>`：接管已有 tmux pane，先只读观察当前输出',
         '`/tmux detach`：退出飞书接管，不关闭 tmux',
         '`/tmux ls|list` / `/tmux capture [lines]` / `/tmux state`：查看 tmux 状态',
+        'tmux 普通消息会按队列等待上一轮稳定后再发送到 pane',
         '`/tmux kill <session>`：仅关闭当前 chat 正在接管的 tmux session',
         '',
         '普通消息会进入当前后端；其他未识别的 `/xxx` 会原样透传给后端。',
@@ -1340,11 +1390,12 @@ export class SessionManager {
           [
             '**tmux 命令**',
             `配置：${this.config.tmux.enabled ? '已启用' : '已禁用（需设置 tmux.enabled=true）'}`,
-            '`/tmux new <session> [claude|codex] [cwd]`：创建或接管 tmux session',
-            '`/tmux attach <session[:window[.pane]]>`：接管已有 pane',
+            '`/tmux new <session> [claude|codex] [cwd]`：创建或接管 tmux session，并同步当前 pane 输出',
+            '`/tmux attach <session[:window[.pane]]>`：接管已有 pane，并先观察未完成输出',
             '`/tmux detach`：飞书端退出接管，不关闭 tmux',
             '`/tmux ls|list`：列出 tmux sessions',
             '`/tmux capture [lines]`：抓取当前 pane 输出',
+            '普通消息按队列等待上一轮输出稳定后再 paste 到 pane',
             '`/tmux kill <session>`：仅关闭当前 chat 正在接管的 tmux session',
             '`/provider claude|codex`：切回直接 SDK 后端',
           ].join('\n'),
@@ -1544,7 +1595,7 @@ export class SessionManager {
     this.chatState.setBackend(msg.chatId, 'tmux');
     await this.startTmuxBridgeSession(
       msg,
-      `已接管 tmux \`${target}\`。后续普通消息会发送到该 pane；电脑端可直接 \`tmux attach -t ${target}\` 接手。`,
+      `已接管 tmux \`${target}\`，正在同步当前 pane 输出。后续普通消息会在上一轮输出稳定后发送到同一个 pane；电脑端可直接 \`tmux attach -t ${target}\` 接手。`,
     );
   }
 
@@ -1578,8 +1629,8 @@ export class SessionManager {
     await this.startTmuxBridgeSession(
       msg,
       existed
-        ? `已接管已有 tmux \`${cmd.sessionName}\`。后续普通消息会发送到该 pane；电脑端可直接 \`tmux attach -t ${cmd.sessionName}\` 接手。`
-        : `已准备 tmux \`${cmd.sessionName}\`（provider=${provider}, cwd=\`${cwd}\`）。后续普通消息会发送到该 pane；电脑端可直接 \`tmux attach -t ${cmd.sessionName}\` 接手。`,
+        ? `已接管已有 tmux \`${cmd.sessionName}\`，正在同步当前 pane 输出。后续普通消息会在上一轮输出稳定后发送到同一个 pane；电脑端可直接 \`tmux attach -t ${cmd.sessionName}\` 接手。`
+        : `已准备 tmux \`${cmd.sessionName}\`（provider=${provider}, cwd=\`${cwd}\`），正在同步当前 pane 输出。后续普通消息会在上一轮输出稳定后发送到同一个 pane；电脑端可直接 \`tmux attach -t ${cmd.sessionName}\` 接手。`,
     );
   }
 

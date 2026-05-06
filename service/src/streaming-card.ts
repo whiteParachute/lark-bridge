@@ -237,8 +237,23 @@ export class StreamingCardController {
   }
 
   async complete(finalText: string): Promise<void> {
+    const textToComplete = finalText || this.accumulatedText;
+    if (!textToComplete.trim() && this.state === 'idle') return;
+
+    if (this.state === 'idle') {
+      this.accumulatedText = textToComplete;
+      this.state = 'creating';
+      try {
+        await this.createInitialCard();
+      } catch (err) {
+        logger.warn({ err, chatId: this.chatId }, 'Streaming card create failed');
+        this.state = 'error';
+        this.onFallback?.();
+        return;
+      }
+    }
     if (this.state !== 'streaming' && this.state !== 'creating') return;
-    this.accumulatedText = finalText;
+    this.accumulatedText = textToComplete;
     this.state = 'completed';
     this.flushCtrl.dispose();
 
