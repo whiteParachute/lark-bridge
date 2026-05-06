@@ -1,7 +1,8 @@
 /**
  * 后端抽象 — Bridge 与具体 LLM SDK 之间的边界。
  *
- * 设计目的：让 SessionManager 不关心底层是 claude-agent-sdk 还是 codex-sdk。
+ * 设计目的：让 SessionManager 不关心底层是 claude-agent-sdk、codex-sdk
+ * 还是一个外部 tmux pane。
  * 所有后端共用一份 `StreamMessage` 协议，差异由各自的 adapter 吸收。
  *
  * Codex SDK 的事件粒度比 claude-sdk 粗（只有 turn 级），所以 codex 后端
@@ -9,7 +10,22 @@
  * 效果在 codex 后端会退化为整段一次到位，可接受。
  */
 
-export type BackendKind = 'claude' | 'codex';
+export type BackendKind = 'claude' | 'codex' | 'tmux';
+export type DirectBackendKind = Exclude<BackendKind, 'tmux'>;
+
+export interface TmuxBackendOptions {
+  target: string;
+  create?: {
+    sessionName: string;
+    provider: DirectBackendKind;
+    command: string;
+    cwd: string;
+  };
+  captureLines: number;
+  pollIntervalMs: number;
+  settleDelayMs: number;
+  turnTimeoutMs: number;
+}
 
 export interface StreamMessage {
   type:
@@ -34,8 +50,11 @@ export interface BackendStartOptions {
   additionalDirectories?: string[];
   sessionId?: string;
   permissionMode?: string;
-  /** 模型名，按后端各自命名规范（claude: 'sonnet'/'opus'/...; codex: 'gpt-5-codex'/...）*/
+  /** 模型名，按后端各自命名规范（claude: 'opus'/...; codex: 'gpt-5.5'/...）*/
   model?: string;
+  /** 推理强度，按后端各自支持的枚举传入。 */
+  reasoningEffort?: string;
+  tmux?: TmuxBackendOptions;
 }
 
 /**
@@ -59,6 +78,7 @@ export interface Backend {
 
 import { ClaudeBackend } from './claude.js';
 import { CodexBackend } from './codex.js';
+import { TmuxBackend } from './tmux.js';
 
 /**
  * Backend 工厂。新增后端时在这里注册。
@@ -69,6 +89,8 @@ export function createBackend(kind: BackendKind): Backend {
       return new ClaudeBackend();
     case 'codex':
       return new CodexBackend();
+    case 'tmux':
+      return new TmuxBackend();
     default: {
       const _exhaustive: never = kind;
       throw new Error(`未知后端类型: ${_exhaustive}`);

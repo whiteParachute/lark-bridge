@@ -16,6 +16,8 @@
  * - **codex**：~/.codex/hooks.json 里全局注册了 aria-memory 的 SessionEnd，
  *   codex CLI 子进程结束时已经会自动登记 rollout。lark-bridge 这边做 no-op
  *   即可，避免重复登记。
+ * - **tmux**：接管的是外部 pane，真实 transcript 归 pane 里的 codex/claude
+ *   CLI 自己维护；bridge 不合成 transcript。
  */
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -101,9 +103,8 @@ function resolveTranscriptPath(args: RegisterArgs): string | null {
   if (args.backendKind === 'claude') {
     return resolveClaudePath(args);
   }
-  // codex 后端：~/.codex/hooks.json 全局 SessionEnd 已经会自动登记 rollout，
-  // 这边不重复做。如果以后发现全局 hook 不生效，再补 ~/.codex/state_*.sqlite
-  // 反查逻辑。
+  // codex/tmux 后端：真实 CLI 自己的 SessionEnd / transcript 体系负责登记；
+  // bridge 不重复做，也不为 tmux capture 输出合成 transcript。
   return null;
 }
 

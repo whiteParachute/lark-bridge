@@ -116,7 +116,10 @@ export class ClaudeBackend implements Backend {
         const q = query({
           prompt: stream as any,
           options: {
-            model: opts.model || 'sonnet',
+            model: opts.model || 'opus',
+            ...(opts.reasoningEffort
+              ? { effort: opts.reasoningEffort as any }
+              : {}),
             cwd: opts.cwd,
             additionalDirectories: opts.additionalDirectories,
             ...(opts.sessionId ? { resume: opts.sessionId } : {}),

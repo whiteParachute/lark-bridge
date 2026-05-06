@@ -24,10 +24,8 @@
  * 鉴权：依靠 codex CLI 自身的会话状态（`codex login` 写到 ~/.codex/auth.json）
  * 或环境变量 `CODEX_API_KEY` / `OPENAI_API_KEY`。本类不直接管理凭证。
  *
- * 模型与推理强度：默认完全跟随用户 ~/.codex/config.toml（不传 `model` /
- * `modelReasoningEffort`）。如果 lark-bridge 配置里写了 `codex.model`，会以
- * 该值覆盖 codex 全局默认 —— 比如想让 lark-bridge 走 `gpt-5-codex` 而 CLI
- * 仍用 `gpt-5.5`。
+ * 模型与推理强度：来自 lark-bridge 配置（默认 `gpt-5.5` + `xhigh`），
+ * 通过 `model` / `modelReasoningEffort` 覆盖 codex 全局默认。
  */
 
 import { Codex, type Thread, type ThreadEvent, type ThreadItem } from '@openai/codex-sdk';
@@ -71,6 +69,9 @@ export class CodexBackend implements Backend {
         ? { additionalDirectories: opts.additionalDirectories }
         : {}),
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.reasoningEffort
+        ? { modelReasoningEffort: opts.reasoningEffort as any }
+        : {}),
     });
 
     this.outputLoop = this.runLoop(onMessage).catch((err) => {
@@ -295,4 +296,3 @@ function toolNameFromItem(item: ThreadItem): string | null {
       return null;
   }
 }
-

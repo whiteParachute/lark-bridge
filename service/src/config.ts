@@ -14,6 +14,13 @@ const HookDefSchema = z.discriminatedUnion('type', [
   }),
 ]);
 
+const ClaudeEffortSchema = z
+  .enum(['low', 'medium', 'high', 'max'])
+  .default('max');
+const CodexReasoningEffortSchema = z
+  .enum(['minimal', 'low', 'medium', 'high', 'xhigh'])
+  .default('xhigh');
+
 const HooksSchema = z
   .object({
     session: z
@@ -70,7 +77,8 @@ const ConfigSchema = z.object({
   defaultBackend: z.enum(['claude', 'codex']).default('claude'),
   claude: z
     .object({
-      model: z.string().default('sonnet'),
+      model: z.string().default('opus'),
+      effort: ClaudeEffortSchema,
       workspaceRoot: z.string().default('~/workspace/lark-bridge'),
       additionalDirectories: z.array(z.string()).default([]),
       /** Allow Claude to access all directories under $HOME. Default: false. */
@@ -81,7 +89,8 @@ const ConfigSchema = z.object({
         .default('auto'),
     })
     .default({
-      model: 'sonnet',
+      model: 'opus',
+      effort: 'max',
       workspaceRoot: '~/workspace/lark-bridge',
       additionalDirectories: [],
       allowAllDirectories: false,
@@ -95,10 +104,40 @@ const ConfigSchema = z.object({
    */
   codex: z
     .object({
-      /** Codex 模型名（如 'gpt-5-codex'）；省略则使用 codex SDK 默认值。 */
-      model: z.string().optional(),
+      /** Codex 模型名；默认 gpt-5.5。 */
+      model: z.string().default('gpt-5.5'),
+      /** Codex 推理强度；透传为 model_reasoning_effort。 */
+      modelReasoningEffort: CodexReasoningEffortSchema,
     })
-    .default({}),
+    .default({ model: 'gpt-5.5', modelReasoningEffort: 'xhigh' }),
+  /**
+   * tmux 接管配置。tmux 后端不会 kill session；lark-bridge 只是 paste 输入和
+   * capture 输出，方便飞书端与电脑端在同一个 codex/claude code 终端间切换。
+   */
+  tmux: z
+    .object({
+      enabled: z.boolean().default(false),
+      defaultProvider: z.enum(['claude', 'codex']).default('codex'),
+      providerCommands: z
+        .object({
+          claude: z.string().min(1).default('claude'),
+          codex: z.string().min(1).default('codex'),
+        })
+        .default({ claude: 'claude', codex: 'codex' }),
+      captureLines: z.number().int().min(20).max(5000).default(200),
+      pollIntervalMs: z.number().int().min(250).default(1000),
+      settleDelayMs: z.number().int().min(1000).default(15_000),
+      turnTimeoutMs: z.number().int().min(10_000).default(20 * 60 * 1000),
+    })
+    .default({
+      enabled: false,
+      defaultProvider: 'codex',
+      providerCommands: { claude: 'claude', codex: 'codex' },
+      captureLines: 200,
+      pollIntervalMs: 1000,
+      settleDelayMs: 15_000,
+      turnTimeoutMs: 20 * 60 * 1000,
+    }),
   session: z
     .object({
       idleTimeoutMs: z.number().default(30 * 60 * 1000),

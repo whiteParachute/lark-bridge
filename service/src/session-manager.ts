@@ -1,5 +1,5 @@
 /**
- * Session Manager — maps Feishu channels to Claude sessions.
+ * Session Manager — maps Feishu channels to backend sessions.
  *
  * Fixes from review:
  * - #1: Sender/chat allowlist check
@@ -15,10 +15,21 @@ import { resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
 import {
   type Backend,
+  type BackendStartOptions,
   type BackendKind,
+  type DirectBackendKind,
   type StreamMessage,
+  type TmuxBackendOptions,
   createBackend,
 } from './backend/index.js';
+import {
+  captureTmuxTarget,
+  ensureTmuxTargetReady,
+  isValidTmuxSessionName,
+  killTmuxSession,
+  listTmuxSessions,
+  tmuxTargetExists,
+} from './backend/tmux.js';
 import { StreamingCardController } from './streaming-card.js';
 import { ProgressCardController } from './progress-card.js';
 import { type TranscriptEntry } from './memory-wrapup.js';
@@ -26,7 +37,7 @@ import { runHooks } from './hooks.js';
 import { type FeishuClient, type FeishuMessage } from './feishu.js';
 import { type BridgeConfig, reloadConfig } from './config.js';
 import { type BotCommand, parseCommand } from './commands.js';
-import { ChatStateStore } from './chat-state.js';
+import { ChatStateStore, type ChatTmuxTarget } from './chat-state.js';
 import { emitReloadWarningsIfWidened } from './allowlist-warnings.js';
 import { logger } from './logger.js';
 import * as lark from '@larksuiteoapi/node-sdk';
@@ -41,6 +52,11 @@ interface Session {
   state: SessionState;
   backend: Backend;
   backendKind: BackendKind;
+  /** 本 session 启动时实际传给后端的模型；undefined 表示使用 SDK/CLI 默认。 */
+  model?: string;
+  /** 本 session 启动时实际传给后端的推理强度。 */
+  reasoningEffort?: string;
+  tmuxTarget?: string;
   /** 后端实际使用的工作目录（per-chat workspace） —— wrapup hook 用它解析 transcript 路径 */
   cwd: string;
   streamingCard: StreamingCardController | null;
@@ -70,6 +86,8 @@ interface Session {
 
 const RATE_LIMIT_MAX_TOKENS = 5;
 const RATE_LIMIT_REFILL_MS = 60_000; // 1 token per 12s → 5 tokens/min
+const MAX_TMUX_CAPTURE_LINES = 5_000;
+const MAX_TMUX_CAPTURE_CHARS = 12_000;
 
 interface RateBucket {
   tokens: number;
@@ -111,6 +129,95 @@ export class SessionManager {
     return false;
   }
 
+  private isDirectBackend(backendKind: BackendKind): backendKind is DirectBackendKind {
+    return backendKind === 'claude' || backendKind === 'codex';
+  }
+
+  private configModel(
+    backendKind: DirectBackendKind,
+    config: BridgeConfig,
+  ): string | undefined {
+    return backendKind === 'codex' ? config.codex.model : config.claude.model;
+  }
+
+  private configReasoningEffort(
+    backendKind: DirectBackendKind,
+    config: BridgeConfig,
+  ): string | undefined {
+    return backendKind === 'codex'
+      ? config.codex.modelReasoningEffort
+      : config.claude.effort;
+  }
+
+  private resolveModel(
+    chatId: string,
+    backendKind: DirectBackendKind,
+    config: BridgeConfig,
+  ): string | undefined {
+    return (
+      this.chatState.getModel(chatId, backendKind) ??
+      this.configModel(backendKind, config)
+    );
+  }
+
+  private modelLabel(model: string | undefined): string {
+    if (!model) return 'SDK 默认模型';
+    return '`' + model.replace(/`/g, "'") + '`';
+  }
+
+  private minutesFromMs(ms: number): number {
+    return Math.max(0, Math.ceil(ms / 60_000));
+  }
+
+  private selectBackendKind(chatId: string): BackendKind {
+    const persisted = this.chatState.getBackend(chatId);
+    if (
+      persisted === 'tmux' &&
+      (!this.config.tmux.enabled || !this.chatState.getTmux(chatId))
+    ) {
+      return this.config.defaultBackend;
+    }
+    return persisted ?? this.config.defaultBackend;
+  }
+
+  private async selectBackendKindForStart(chatId: string): Promise<{
+    backendKind: BackendKind;
+    clearedTmuxTarget?: string;
+  }> {
+    const backendKind = this.selectBackendKind(chatId);
+    if (backendKind !== 'tmux') return { backendKind };
+
+    const target = this.chatState.getTmux(chatId);
+    if (!this.config.tmux.enabled || !target) {
+      return { backendKind: this.config.defaultBackend };
+    }
+
+    // `/tmux new` targets may legitimately be absent; createSession will create
+    // them before acknowledging success. Attached targets must still exist.
+    if (target.create && target.sessionName) return { backendKind };
+    if (await tmuxTargetExists(target.target)) return { backendKind };
+
+    this.chatState.clearTmux(chatId);
+    return {
+      backendKind: this.config.defaultBackend,
+      clearedTmuxTarget: target.target,
+    };
+  }
+
+  private workspaceDirFor(chatId: string, config: BridgeConfig = this.config): string {
+    return resolve(
+      config.claude.workspaceRoot,
+      chatId.replace(/[^a-zA-Z0-9_-]/g, '_'),
+    );
+  }
+
+  private expandUserPath(input: string | undefined, fallback: string): string {
+    if (!input) return fallback;
+    if (input === '~') return homedir();
+    if (input.startsWith('~/')) return resolve(homedir(), input.slice(2));
+    return resolve(input);
+  }
+
   async handleMessage(msg: FeishuMessage): Promise<void> {
     // Hot-reload config so allowlist changes take effect without daemon restart.
     // 比较新旧 allowlist：变得更危险（允许更多人/群）就 warn 到日志——给运维一条
@@ -141,7 +248,8 @@ export class SessionManager {
     }
 
     // ── Bot 命令分流 ──
-    // 命中白名单（/new、/provider、/hold、/state）则在 bridge 内处理；
+    // 命中白名单（/help、/new、/provider、/hold、/release、/state、/model、/tmux）
+    // 则在 bridge 内处理；
     // 其他 `/xxx`（包括 Claude Code 自身的 slash command）原样进后端。
     const command = parseCommand(msg.text);
     if (command) {
@@ -176,10 +284,52 @@ export class SessionManager {
         pendingQueue.push(msg);
         return;
       }
-      // 默认后端来源优先级：chat-state 持久值 > config.defaultBackend
-      const backendKind =
-        this.chatState.getBackend(chatId) ?? this.config.defaultBackend;
-      session = await this.startCreate(chatId, msg.chatType, backendKind);
+      // 默认后端来源优先级：chat-state 持久值 > config.defaultBackend。
+      // 如果持久值是 tmux，还需要有可用的 tmux target。
+      const { backendKind, clearedTmuxTarget } =
+        await this.selectBackendKindForStart(chatId);
+      if (clearedTmuxTarget) {
+        await this.feishu.sendMessage(
+          chatId,
+          `⚠️ tmux target \`${clearedTmuxTarget}\` 已不存在，已清除接管状态并改用 ${backendKind} 后端处理本条消息。`,
+        );
+      }
+      try {
+        session = await this.startCreate(chatId, msg.chatType, backendKind);
+      } catch (err: any) {
+        logger.error({ err, chatId, backendKind }, 'Session create failed');
+        if (backendKind !== 'tmux') {
+          await this.feishu.sendMessage(
+            chatId,
+            `⚠️ 会话启动失败: ${err?.message || String(err)}`,
+          );
+          return;
+        }
+
+        const failedTarget = this.chatState.getTmux(chatId)?.target;
+        this.chatState.clearTmux(chatId);
+        await this.feishu.sendMessage(
+          chatId,
+          `⚠️ tmux 接管启动失败${failedTarget ? `（${failedTarget}）` : ''}，已清除接管状态并改用 ${this.config.defaultBackend} 后端重试。错误：${err?.message || String(err)}`,
+        );
+        try {
+          session = await this.startCreate(
+            chatId,
+            msg.chatType,
+            this.config.defaultBackend,
+          );
+        } catch (fallbackErr: any) {
+          logger.error(
+            { err: fallbackErr, chatId },
+            'Fallback session create failed after tmux failure',
+          );
+          await this.feishu.sendMessage(
+            chatId,
+            `⚠️ fallback 会话启动失败: ${fallbackErr?.message || String(fallbackErr)}`,
+          );
+          return;
+        }
+      }
     }
 
     await this.deliverUserMessage(session, msg);
@@ -396,15 +546,19 @@ export class SessionManager {
     // Snapshot current config — this session uses it for its entire lifetime
     const sessionConfig = structuredClone(this.config);
 
-    const workspaceDir = resolve(
-      sessionConfig.claude.workspaceRoot,
-      chatId.replace(/[^a-zA-Z0-9_-]/g, '_'),
-    );
+    const workspaceDir = this.workspaceDirFor(chatId, sessionConfig);
     if (!existsSync(workspaceDir)) {
       mkdirSync(workspaceDir, { recursive: true });
     }
 
     const backend = createBackend(backendKind);
+    const model = this.isDirectBackend(backendKind)
+      ? this.resolveModel(chatId, backendKind, sessionConfig)
+      : undefined;
+    const reasoningEffort = this.isDirectBackend(backendKind)
+      ? this.configReasoningEffort(backendKind, sessionConfig)
+      : undefined;
+    const tmuxTarget = backendKind === 'tmux' ? this.chatState.getTmux(chatId) : null;
     const progressCard = new ProgressCardController(this.larkClient, chatId);
 
     const session: Session = {
@@ -413,6 +567,9 @@ export class SessionManager {
       state: 'starting',
       backend,
       backendKind,
+      model,
+      reasoningEffort,
+      tmuxTarget: tmuxTarget?.target,
       cwd: workspaceDir,
       streamingCard: null,
       progressCard,
@@ -465,36 +622,137 @@ export class SessionManager {
       additionalDirectories.push(ariaDir);
     }
 
-    const startOpts =
+    const startOpts: BackendStartOptions =
       backendKind === 'codex'
         ? {
             cwd: workspaceDir,
             additionalDirectories,
-            ...(sessionConfig.codex.model ? { model: sessionConfig.codex.model } : {}),
+            ...(model ? { model } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {}),
           }
-        : {
+        : backendKind === 'claude'
+          ? {
             cwd: workspaceDir,
             additionalDirectories,
-            model: sessionConfig.claude.model,
+            model: model ?? sessionConfig.claude.model,
+            reasoningEffort,
             permissionMode: sessionConfig.claude.permissionMode,
-          };
+          }
+          : {
+              cwd: workspaceDir,
+              tmux: this.buildTmuxStartOptions(
+                chatId,
+                sessionConfig,
+                workspaceDir,
+                tmuxTarget,
+                additionalDirectories,
+              ),
+            };
+    if (backendKind === 'tmux' && startOpts.tmux) {
+      await ensureTmuxTargetReady(startOpts.tmux);
+    }
     backend.start(startOpts, (msg) => this.handleStreamMessage(session, msg));
 
     // Fix #8: max duration timer (skip if session is already held)
     if (!session.held) {
-      session.maxDurationTimer = setTimeout(() => {
-        logger.info({ chatId }, 'Session max duration reached');
-        this.closeSession(
-          session,
-          '会���已达最长时限，自动关闭。���送新消息可开���新对��。',
-        ).catch((err) => {
-          logger.error({ err, chatId }, 'Error closing max-duration session');
-        });
-      }, sessionConfig.session.maxDurationMs);
+      this.armMaxDurationTimer(session, sessionConfig.session.maxDurationMs);
     }
 
-    logger.info({ chatId, chatType, workspaceDir }, 'Session created');
+    logger.info(
+      {
+        chatId,
+        chatType,
+        backendKind,
+        workspaceDir,
+        model,
+        reasoningEffort,
+        tmuxTarget,
+      },
+      'Session created',
+    );
     return session;
+  }
+
+  private buildTmuxStartOptions(
+    chatId: string,
+    config: BridgeConfig,
+    fallbackCwd: string,
+    target: ChatTmuxTarget | null,
+    additionalDirectories: string[],
+  ): TmuxBackendOptions {
+    if (!config.tmux.enabled) {
+      throw new Error('tmux backend is disabled by config');
+    }
+    if (!target) {
+      throw new Error(`chat ${chatId} has no tmux target`);
+    }
+
+    const provider = target.provider ?? config.tmux.defaultProvider;
+    const cwd = this.expandUserPath(target.cwd, fallbackCwd);
+    const command = this.buildTmuxProviderCommand(
+      chatId,
+      provider,
+      config,
+      cwd,
+      additionalDirectories,
+    );
+    const create =
+      target.create && target.sessionName
+        ? {
+            sessionName: target.sessionName,
+            provider,
+            command,
+            cwd,
+          }
+        : undefined;
+
+    return {
+      target: target.target,
+      ...(create ? { create } : {}),
+      captureLines: config.tmux.captureLines,
+      pollIntervalMs: config.tmux.pollIntervalMs,
+      settleDelayMs: config.tmux.settleDelayMs,
+      turnTimeoutMs: config.tmux.turnTimeoutMs,
+    };
+  }
+
+  private buildTmuxProviderCommand(
+    chatId: string,
+    provider: DirectBackendKind,
+    config: BridgeConfig,
+    cwd: string,
+    additionalDirectories: string[],
+  ): string {
+    const base = config.tmux.providerCommands[provider];
+    const model = this.resolveModel(chatId, provider, config);
+    const reasoningEffort = this.configReasoningEffort(provider, config);
+
+    if (provider === 'codex') {
+      const args = [
+        ...(model ? ['--model', model] : []),
+        ...(reasoningEffort
+          ? ['--config', `model_reasoning_effort="${reasoningEffort}"`]
+          : []),
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--cd',
+        cwd,
+        ...additionalDirectories.flatMap((dir) => ['--add-dir', dir]),
+      ];
+      return [base, ...args.map((arg) => shellQuote(arg))].join(' ');
+    }
+
+    const permissionMode = config.claude.permissionMode;
+    const args = [
+      ...(model ? ['--model', model] : []),
+      ...(reasoningEffort ? ['--effort', reasoningEffort] : []),
+      '--permission-mode',
+      permissionMode,
+      ...additionalDirectories.flatMap((dir) => ['--add-dir', dir]),
+      ...(permissionMode === 'bypassPermissions'
+        ? ['--allow-dangerously-skip-permissions']
+        : []),
+    ];
+    return [base, ...args.map((arg) => shellQuote(arg))].join(' ');
   }
 
   private handleStreamMessage(session: Session, msg: StreamMessage): void {
@@ -506,7 +764,7 @@ export class SessionManager {
         session.state = 'active';
         logger.info(
           { chatId, sessionId: msg.sessionId },
-          'Claude session initialized',
+          'Backend session initialized',
         );
 
         // Flush queued messages: merge into a single message to avoid card churn
@@ -622,7 +880,10 @@ export class SessionManager {
       }
 
       case 'error':
-        logger.error({ chatId, error: msg.error }, 'Claude session error');
+        logger.error({ chatId, error: msg.error }, 'Backend session error');
+        if (session.backendKind === 'tmux') {
+          this.chatState.clearTmux(chatId);
+        }
         // Signal turn completion on error too
         if (session.turnCompleteResolve) {
           session.turnCompleteResolve();
@@ -651,7 +912,7 @@ export class SessionManager {
       logger.info({ chatId: session.chatId }, 'Session idle timeout');
       this.closeSession(
         session,
-        '会话空闲超时，已自动关��。发送���消息可开启新对话。',
+        '会话空闲超时，已自动关闭。发送新消息可开启新对话。',
       ).catch((err) => {
         logger.error(
           { err, chatId: session.chatId },
@@ -659,6 +920,22 @@ export class SessionManager {
         );
       });
     }, session.config.session.idleTimeoutMs);
+  }
+
+  private armMaxDurationTimer(session: Session, delayMs: number): void {
+    if (session.maxDurationTimer) clearTimeout(session.maxDurationTimer);
+    session.maxDurationTimer = setTimeout(() => {
+      logger.info({ chatId: session.chatId }, 'Session max duration reached');
+      this.closeSession(
+        session,
+        '会话已达最长时限，自动关闭。发送新消息可开启新对话。',
+      ).catch((err) => {
+        logger.error(
+          { err, chatId: session.chatId },
+          'Error closing max-duration session',
+        );
+      });
+    }, delayMs);
   }
 
   private async closeSession(
@@ -726,6 +1003,9 @@ export class SessionManager {
       chatType: s.chatType,
       state: s.state,
       backend: s.backendKind,
+      model: s.model ?? null,
+      reasoningEffort: s.reasoningEffort ?? null,
+      tmuxTarget: s.tmuxTarget ?? null,
       held: s.held,
       messageCount: s.transcript.length,
       createdAt: new Date(s.createdAt).toISOString(),
@@ -762,6 +1042,10 @@ export class SessionManager {
         await this.feishu.sendMessage(chatId, `⚠️ ${cmd.reason}`);
         return;
 
+      case 'help':
+        await this.commandHelp(chatId);
+        return;
+
       case 'state':
         await this.commandState(chatId);
         return;
@@ -770,9 +1054,27 @@ export class SessionManager {
         await this.commandHold(chatId);
         return;
 
+      case 'release':
+        await this.commandRelease(chatId);
+        return;
+
+      case 'model':
+        await this.commandModel(msg, cmd);
+        return;
+
+      case 'tmux':
+        await this.commandTmux(msg, cmd);
+        return;
+
       case 'new': {
-        const backendKind =
-          this.chatState.getBackend(chatId) ?? this.config.defaultBackend;
+        const { backendKind, clearedTmuxTarget } =
+          await this.selectBackendKindForStart(chatId);
+        if (clearedTmuxTarget) {
+          await this.feishu.sendMessage(
+            chatId,
+            `⚠️ tmux target \`${clearedTmuxTarget}\` 已不存在，已清除接管状态。`,
+          );
+        }
         await this.commandResetSession(msg, backendKind, cmd.prompt, false);
         return;
       }
@@ -795,6 +1097,7 @@ export class SessionManager {
     backendKind: BackendKind,
     inlinePrompt: string | undefined,
     persistBackend: boolean,
+    ackPrefixOverride?: string,
   ): Promise<void> {
     const { chatId } = msg;
 
@@ -821,9 +1124,11 @@ export class SessionManager {
       });
     }
 
-    const ackPrefix = persistBackend
-      ? `🔁 已切换到 ${backendKind} 后端。`
-      : `🆕 已开启新会话（${backendKind}）。`;
+    const ackPrefix =
+      ackPrefixOverride ??
+      (persistBackend
+        ? `🔁 已切换到 ${backendKind} 后端。`
+        : `🆕 已开启新会话（${backendKind}）。`);
 
     if (!inlinePrompt) {
       await this.feishu.sendMessage(
@@ -839,7 +1144,24 @@ export class SessionManager {
     // handleMessage 入口处消耗过）。
     await this.feishu.sendMessage(chatId, ackPrefix);
 
-    const session = await this.startCreate(chatId, msg.chatType, backendKind);
+    let session: Session;
+    try {
+      session = await this.startCreate(chatId, msg.chatType, backendKind);
+    } catch (err: any) {
+      if (backendKind !== 'tmux') throw err;
+
+      const failedTarget = this.chatState.getTmux(chatId)?.target;
+      this.chatState.clearTmux(chatId);
+      await this.feishu.sendMessage(
+        chatId,
+        `⚠️ tmux 接管启动失败${failedTarget ? `（${failedTarget}）` : ''}，已清除接管状态并改用 ${this.config.defaultBackend} 后端处理这条 prompt。错误：${err?.message || String(err)}`,
+      );
+      session = await this.startCreate(
+        chatId,
+        msg.chatType,
+        this.config.defaultBackend,
+      );
+    }
     const continuationMsg: FeishuMessage = {
       ...msg,
       text: inlinePrompt,
@@ -872,15 +1194,436 @@ export class SessionManager {
     logger.info({ chatId }, 'Session held — idle/max timers suspended');
     await this.feishu.sendMessage(
       chatId,
-      '✋ 会话已保持，将不会被空闲或最长时限自动关闭。下次 `/new` 或 `/provider` 可解除。',
+      '✋ 会话已保持，将不会被空闲或最长时限自动关闭。发送 `/release` 可恢复自动关闭计时。',
     );
+  }
+
+  private async commandHelp(chatId: string): Promise<void> {
+    await this.feishu.sendMessage(
+      chatId,
+      [
+        '**lark-bridge 命令**',
+        '`/new [prompt]`：关闭当前会话，用当前默认后端开新会话',
+        '`/provider claude|codex [prompt]`：切换直接 SDK 后端',
+        '`/model [model|reset] [prompt]`：查看/设置当前直接后端模型',
+        '`/hold` / `/release`：保持会话 / 恢复自动关闭',
+        '`/state`：查看当前会话状态',
+        `tmux：${this.config.tmux.enabled ? '已启用' : '已禁用（需在配置中开启）'}`,
+        '`/tmux new <session> [claude|codex] [cwd]`：新建或接管 tmux session',
+        '`/tmux attach <target>`：接管已有 tmux pane',
+        '`/tmux detach`：退出飞书接管，不关闭 tmux',
+        '`/tmux ls|list` / `/tmux capture [lines]` / `/tmux state`：查看 tmux 状态',
+        '`/tmux kill <session>`：仅关闭当前 chat 正在接管的 tmux session',
+        '',
+        '普通消息会进入当前后端；其他未识别的 `/xxx` 会原样透传给后端。',
+      ].join('\n'),
+    );
+  }
+
+  private async commandRelease(chatId: string): Promise<void> {
+    const session = this.sessions.get(chatId);
+    if (!session) {
+      await this.feishu.sendMessage(chatId, '当前没有活跃会话。');
+      return;
+    }
+    if (!session.held) {
+      await this.feishu.sendMessage(chatId, '当前会话未处于保持状态。');
+      return;
+    }
+
+    session.held = false;
+    const maxRemainingMs =
+      session.createdAt + session.config.session.maxDurationMs - Date.now();
+
+    if (maxRemainingMs <= 0) {
+      await this.closeSession(
+        session,
+        '会话已超过最长时限，解除保持后已自动关闭。发送新消息可开启新对话。',
+      );
+      return;
+    }
+
+    this.resetIdleTimer(session);
+    this.armMaxDurationTimer(session, maxRemainingMs);
+
+    await this.feishu.sendMessage(
+      chatId,
+      [
+        '▶️ 会话已恢复自动关闭计时。',
+        `空闲关闭：约 ${this.minutesFromMs(session.config.session.idleTimeoutMs)} 分钟后`,
+        `最长时限：约 ${this.minutesFromMs(maxRemainingMs)} 分钟后`,
+      ].join('\n'),
+    );
+  }
+
+  private async commandModel(
+    msg: FeishuMessage,
+    cmd: Extract<BotCommand, { type: 'model' }>,
+  ): Promise<void> {
+    const { chatId } = msg;
+    const session = this.sessions.get(chatId);
+    const backendKind =
+      session?.backendKind ??
+      this.selectBackendKind(chatId);
+    if (!this.isDirectBackend(backendKind)) {
+      await this.feishu.sendMessage(
+        chatId,
+        '当前是 tmux 接管模式。`/model` 只作用于直接 Claude/Codex 后端；tmux 里的 codex/claude code 模型请在对应 CLI 内切换，或先 `/provider claude|codex` 回到直接后端。',
+      );
+      return;
+    }
+    const configModel = this.configModel(backendKind, this.config);
+    const overrideModel = this.chatState.getModel(chatId, backendKind);
+    const effectiveModel = overrideModel ?? configModel;
+
+    if (cmd.action === 'show') {
+      const lines = [
+        '**🧠 模型设置**',
+        `后端：\`${backendKind}\``,
+        session
+          ? `当前会话模型：${this.modelLabel(session.model)}`
+          : '当前没有活跃会话。',
+        `下次新会话模型：${this.modelLabel(effectiveModel)}`,
+        `推理强度：${this.modelLabel(this.configReasoningEffort(backendKind, this.config))}`,
+        overrideModel
+          ? `本 chat 覆盖：${this.modelLabel(overrideModel)}`
+          : '本 chat 覆盖：未设置',
+        `配置默认：${this.modelLabel(configModel)}`,
+        '',
+        '用法：`/model <model> [prompt]` 或 `/model reset [prompt]`',
+      ];
+      await this.feishu.sendMessage(chatId, lines.join('\n'));
+      return;
+    }
+
+    if (cmd.action === 'reset') {
+      this.chatState.clearModel(chatId, backendKind);
+      await this.commandResetSession(
+        msg,
+        backendKind,
+        cmd.prompt,
+        false,
+        `🧠 已清除 ${backendKind} 模型覆盖，将使用 ${this.modelLabel(configModel)}。`,
+      );
+      return;
+    }
+
+    this.chatState.setModel(chatId, backendKind, cmd.model);
+    await this.commandResetSession(
+      msg,
+      backendKind,
+      cmd.prompt,
+      false,
+      `🧠 已将 ${backendKind} 模型切换为 ${this.modelLabel(cmd.model)}。`,
+    );
+  }
+
+  private async commandTmux(
+    msg: FeishuMessage,
+    cmd: Extract<BotCommand, { type: 'tmux' }>,
+  ): Promise<void> {
+    const { chatId } = msg;
+    if (
+      !this.config.tmux.enabled &&
+      cmd.action !== 'state' &&
+      cmd.action !== 'help' &&
+      cmd.action !== 'detach'
+    ) {
+      await this.feishu.sendMessage(chatId, 'tmux 后端已被配置禁用。');
+      return;
+    }
+
+    switch (cmd.action) {
+      case 'help':
+        await this.feishu.sendMessage(
+          chatId,
+          [
+            '**tmux 命令**',
+            `配置：${this.config.tmux.enabled ? '已启用' : '已禁用（需设置 tmux.enabled=true）'}`,
+            '`/tmux new <session> [claude|codex] [cwd]`：创建或接管 tmux session',
+            '`/tmux attach <session[:window[.pane]]>`：接管已有 pane',
+            '`/tmux detach`：飞书端退出接管，不关闭 tmux',
+            '`/tmux ls|list`：列出 tmux sessions',
+            '`/tmux capture [lines]`：抓取当前 pane 输出',
+            '`/tmux kill <session>`：仅关闭当前 chat 正在接管的 tmux session',
+            '`/provider claude|codex`：切回直接 SDK 后端',
+          ].join('\n'),
+        );
+        return;
+
+      case 'state':
+        await this.commandTmuxState(chatId);
+        return;
+
+      case 'ls':
+        await this.commandTmuxList(chatId);
+        return;
+
+      case 'kill':
+        await this.commandTmuxKill(chatId, cmd.sessionName);
+        return;
+
+      case 'capture':
+        await this.commandTmuxCapture(chatId, cmd.lines);
+        return;
+
+      case 'detach':
+        await this.commandTmuxDetach(chatId);
+        return;
+
+      case 'attach':
+        await this.commandTmuxAttach(msg, cmd.target);
+        return;
+
+      case 'new':
+        await this.commandTmuxNew(msg, cmd);
+        return;
+    }
+  }
+
+  private async commandTmuxList(chatId: string): Promise<void> {
+    try {
+      const sessions = await listTmuxSessions();
+      if (sessions.length === 0) {
+        await this.feishu.sendMessage(chatId, '当前没有 tmux session。');
+        return;
+      }
+      const lines = sessions.map(
+        (s) =>
+          `- \`${s.name}\` windows=${s.windows} attached=${s.attached} created=${s.created}`,
+      );
+      await this.feishu.sendMessage(chatId, lines.join('\n'));
+    } catch (err: any) {
+      await this.feishu.sendMessage(
+        chatId,
+        `未能列出 tmux session：${err?.message || String(err)}`,
+      );
+    }
+  }
+
+  private async commandTmuxKill(
+    chatId: string,
+    sessionName: string,
+  ): Promise<void> {
+    if (!isValidTmuxSessionName(sessionName)) {
+      await this.feishu.sendMessage(
+        chatId,
+        'tmux session 名只能包含字母、数字、下划线、点和横线，且不能以横线开头。',
+      );
+      return;
+    }
+
+    const existing = this.sessions.get(chatId);
+    const persisted = this.chatState.getTmux(chatId);
+    const killsCurrent =
+      (existing?.backendKind === 'tmux' &&
+        this.tmuxSessionName(existing.tmuxTarget) === sessionName) ||
+      this.tmuxSessionName(persisted?.target) === sessionName;
+
+    if (!killsCurrent) {
+      await this.feishu.sendMessage(
+        chatId,
+        '出于安全边界，`/tmux kill` 只能关闭当前 chat 正在接管的 tmux session。先用 `/tmux state` 确认目标。',
+      );
+      return;
+    }
+
+    if (!(await tmuxTargetExists(sessionName))) {
+      await this.feishu.sendMessage(
+        chatId,
+        `未找到 tmux session：\`${sessionName}\`。可先用 \`/tmux ls\` 查看。`,
+      );
+      return;
+    }
+
+    if (killsCurrent && existing?.backendKind === 'tmux') {
+      await this.closeSession(existing).catch((err) => {
+        logger.error({ err, chatId }, 'Error closing tmux bridge before kill');
+      });
+    }
+
+    try {
+      await killTmuxSession(sessionName);
+      if (killsCurrent) this.chatState.clearTmux(chatId);
+      await this.feishu.sendMessage(
+        chatId,
+        `已关闭 tmux session：\`${sessionName}\`${killsCurrent ? '，并清除了当前 chat 的 tmux 接管目标。' : '。'}`,
+      );
+    } catch (err: any) {
+      await this.feishu.sendMessage(
+        chatId,
+        `关闭 tmux session \`${sessionName}\` 失败：${err?.message || String(err)}`,
+      );
+    }
+  }
+
+  private tmuxSessionName(target: string | undefined): string | null {
+    if (!target) return null;
+    return target.split(':', 1)[0] || null;
+  }
+
+  private async commandTmuxState(chatId: string): Promise<void> {
+    const session = this.sessions.get(chatId);
+    const target = this.chatState.getTmux(chatId);
+    const lines = ['**tmux 接管状态**'];
+    lines.push(`配置：${this.config.tmux.enabled ? '已启用' : '已禁用'}`);
+    lines.push(`当前后端：\`${session?.backendKind ?? this.selectBackendKind(chatId)}\``);
+    lines.push(
+      target
+        ? `持久目标：\`${target.target}\`${target.create ? '（可自动创建）' : ''}`
+        : '持久目标：未设置',
+    );
+    if (target?.provider) lines.push(`tmux provider：\`${target.provider}\``);
+    if (target?.cwd) lines.push(`tmux cwd：\`${target.cwd}\``);
+    if (session?.backendKind === 'tmux') {
+      lines.push(`活跃接管：\`${session.tmuxTarget ?? target?.target ?? '-'}\``);
+    }
+    await this.feishu.sendMessage(chatId, lines.join('\n'));
+  }
+
+  private async commandTmuxCapture(
+    chatId: string,
+    lines?: number,
+  ): Promise<void> {
+    const target =
+      this.sessions.get(chatId)?.tmuxTarget ??
+      this.chatState.getTmux(chatId)?.target;
+    if (!target) {
+      await this.feishu.sendMessage(
+        chatId,
+        '当前没有 tmux 接管目标。先用 `/tmux attach <target>` 或 `/tmux new <session>`。',
+      );
+      return;
+    }
+    const requestedLines = lines ?? this.config.tmux.captureLines;
+    const captureLines = Math.min(
+      Math.max(1, requestedLines),
+      MAX_TMUX_CAPTURE_LINES,
+    );
+    try {
+      const text = clipTmuxCapture(await captureTmuxTarget(target, captureLines));
+      await this.feishu.sendMessage(
+        chatId,
+        text.trim() || `tmux \`${target}\` 当前没有可见输出。`,
+      );
+    } catch (err: any) {
+      await this.feishu.sendMessage(
+        chatId,
+        `抓取 tmux \`${target}\` 失败：${err?.message || String(err)}`,
+      );
+    }
+  }
+
+  private async commandTmuxDetach(chatId: string): Promise<void> {
+    const existing = this.sessions.get(chatId);
+    if (existing?.backendKind === 'tmux') {
+      await this.closeSession(existing).catch((err) => {
+        logger.error({ err, chatId }, 'Error closing tmux bridge session');
+      });
+    }
+    this.chatState.clearTmux(chatId);
+    await this.feishu.sendMessage(
+      chatId,
+      '已从 tmux 接管模式退出；tmux session 仍在后台运行。',
+    );
+  }
+
+  private async commandTmuxAttach(
+    msg: FeishuMessage,
+    target: string,
+  ): Promise<void> {
+    if (!(await tmuxTargetExists(target))) {
+      await this.feishu.sendMessage(
+        msg.chatId,
+        `未找到 tmux target：\`${target}\`。可先用 \`/tmux ls\` 查看。`,
+      );
+      return;
+    }
+
+    this.chatState.setTmux(msg.chatId, { target });
+    this.chatState.setBackend(msg.chatId, 'tmux');
+    await this.startTmuxBridgeSession(
+      msg,
+      `已接管 tmux \`${target}\`。后续普通消息会发送到该 pane；电脑端可直接 \`tmux attach -t ${target}\` 接手。`,
+    );
+  }
+
+  private async commandTmuxNew(
+    msg: FeishuMessage,
+    cmd: Extract<BotCommand, { type: 'tmux'; action: 'new' }>,
+  ): Promise<void> {
+    if (!isValidTmuxSessionName(cmd.sessionName)) {
+      await this.feishu.sendMessage(
+        msg.chatId,
+        'tmux session 名只能包含字母、数字、下划线、点和横线，且不能以横线开头。',
+      );
+      return;
+    }
+
+    const provider = cmd.provider ?? this.config.tmux.defaultProvider;
+    const cwd = this.expandUserPath(
+      cmd.cwd,
+      this.workspaceDirFor(msg.chatId, this.config),
+    );
+    const existed = await tmuxTargetExists(cmd.sessionName);
+    const target: ChatTmuxTarget = {
+      target: cmd.sessionName,
+      create: true,
+      sessionName: cmd.sessionName,
+      provider,
+      cwd,
+    };
+    this.chatState.setTmux(msg.chatId, target);
+    this.chatState.setBackend(msg.chatId, 'tmux');
+    await this.startTmuxBridgeSession(
+      msg,
+      existed
+        ? `已接管已有 tmux \`${cmd.sessionName}\`。后续普通消息会发送到该 pane；电脑端可直接 \`tmux attach -t ${cmd.sessionName}\` 接手。`
+        : `已准备 tmux \`${cmd.sessionName}\`（provider=${provider}, cwd=\`${cwd}\`）。后续普通消息会发送到该 pane；电脑端可直接 \`tmux attach -t ${cmd.sessionName}\` 接手。`,
+    );
+  }
+
+  private async startTmuxBridgeSession(
+    msg: FeishuMessage,
+    ack: string,
+  ): Promise<void> {
+    const { chatId } = msg;
+
+    const inflight = this.creatingPromises.get(chatId);
+    if (inflight) {
+      await inflight.catch(() => {});
+    }
+
+    const existing = this.sessions.get(chatId);
+    if (existing && existing.state !== 'closed') {
+      await this.closeSession(existing).catch((err) => {
+        logger.error({ err, chatId }, 'Error closing previous session for /tmux');
+      });
+    }
+
+    try {
+      await this.startCreate(chatId, msg.chatType, 'tmux');
+      await this.feishu.sendMessage(chatId, ack);
+    } catch (err: any) {
+      logger.error({ err, chatId }, 'tmux session start failed');
+      this.chatState.clearTmux(chatId);
+      await this.feishu.sendMessage(
+        chatId,
+        `⚠️ tmux 接管失败：${err?.message || String(err)}`,
+      );
+    }
   }
 
   private async commandState(chatId: string): Promise<void> {
     const session = this.sessions.get(chatId);
     if (!session) {
       const persistedBackend = this.chatState.getBackend(chatId);
-      const backendStr = persistedBackend ? `（默认后端：${persistedBackend}）` : '';
+      const tmuxTarget = this.chatState.getTmux(chatId)?.target;
+      const backendStr = persistedBackend
+        ? `（默认后端：${persistedBackend}${
+            persistedBackend === 'tmux' && tmuxTarget ? `:${tmuxTarget}` : ''
+          }）`
+        : '';
       await this.feishu.sendMessage(
         chatId,
         `当前没有活跃会话。${backendStr}\n发送任意消息开启新会话。`,
@@ -896,6 +1639,12 @@ export class SessionManager {
     const lines: string[] = [];
     lines.push(`**📊 会话状态**`);
     lines.push(`后端：\`${session.backendKind}\``);
+    if (session.backendKind === 'tmux') {
+      lines.push(`tmux：\`${session.tmuxTarget ?? '-'}\``);
+    } else {
+      lines.push(`模型：${this.modelLabel(session.model)}`);
+      lines.push(`推理强度：${this.modelLabel(session.reasoningEffort)}`);
+    }
     lines.push(`状态：${this.stateLabel(session)}`);
 
     if (snap.activeTools.length > 0) {
@@ -930,4 +1679,14 @@ export class SessionManager {
     }
     return '💤 空闲';
   }
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_/:=@%+.,-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function clipTmuxCapture(text: string): string {
+  if (text.length <= MAX_TMUX_CAPTURE_CHARS) return text;
+  return text.slice(text.length - MAX_TMUX_CAPTURE_CHARS);
 }
