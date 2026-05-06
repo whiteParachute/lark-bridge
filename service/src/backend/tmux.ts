@@ -312,10 +312,27 @@ export async function ensureTmuxTargetReady(
 }
 
 async function pasteToTmux(target: string, text: string): Promise<void> {
+  const normalizedText = normalizeTmuxInput(text);
+  if (!normalizedText) return;
+
+  if (!normalizedText.includes('\n') && normalizedText.length <= 4000) {
+    await runTmux(['send-keys', '-t', target, '-l', normalizedText]);
+    await submitTmuxInput(target);
+    return;
+  }
+
   const bufferName = `lark_bridge_${Date.now()}`;
-  await runTmux(['load-buffer', '-b', bufferName, '-'], text);
+  await runTmux(['load-buffer', '-b', bufferName, '-'], normalizedText);
   await runTmux(['paste-buffer', '-b', bufferName, '-t', target]);
   await runTmux(['delete-buffer', '-b', bufferName]).catch(() => {});
+  await submitTmuxInput(target);
+}
+
+function normalizeTmuxInput(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+$/g, '');
+}
+
+async function submitTmuxInput(target: string): Promise<void> {
   await runTmux(['send-keys', '-t', target, 'Enter']);
 }
 

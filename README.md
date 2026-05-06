@@ -318,7 +318,7 @@ tmux 接管不会 kill pane：`/provider claude|codex` 或 `/tmux detach` 只关
 codex 会追加 `--model`、`--config model_reasoning_effort=...`、`--dangerously-bypass-approvals-and-sandbox`、`--cd`、`--add-dir`；
 claude 会追加 `--model`、`--effort`、`--permission-mode`、`--add-dir`。`tmux.providerCommands` 只用于配置基础命令或包装脚本名。
 
-tmux 后端没有 SDK turn-complete 事件，只能在 pane 输出静默 `settleDelayMs` 后认为本轮完成；这同样适用于 attach 后的只读观察轮和飞书侧下发的新请求。普通消息会串行投递：上一轮未稳定时，新消息不会提前写 transcript / 跑 `message.pre` hooks / paste 到 pane。
+tmux 后端没有 SDK turn-complete 事件，只能在 pane 输出静默 `settleDelayMs` 后认为本轮完成；这同样适用于 attach 后的只读观察轮和飞书侧下发的新请求。普通消息会串行投递：上一轮未稳定时，新消息不会提前写 transcript / 跑 `message.pre` hooks / paste 到 pane。飞书消息末尾的 CR/LF 会在发送到 tmux 前剥掉，避免把“发送消息的回车”当成 TUI 输入框里的正文换行；正文内部换行仍保留。单行消息使用 `tmux send-keys -l` 输入后再提交，多行消息才使用 `paste-buffer`。
 
 权限：bot 命令复用 `feishu.allowedSenders` / `allowedChats` 白名单，没有独立权限层。
 
