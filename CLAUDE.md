@@ -42,11 +42,12 @@ cd service && npm run dev        # tsc --watch
 
 1. `FeishuClient` (`feishu.ts`) — Lark SDK `WSClient`，把 `text` / `post` / `image` / `file` 解码为 `FeishuMessage`。带一个 **WS 看门狗**：扫描 SDK logger 输出里的失败模式 (`/timeout/`、`/unable to connect/`、`ECONNRESET` 等)，连续失败 N 次或静默超时后强制重连。看门狗是**唯一**恢复路径，否则 SDK 会静默死亡。
 2. `SessionManager.handleMessage` (`session-manager.ts`) — 热加载配置（这样改 allowlist 不用重启 daemon），校验 `allowedSenders`/`allowedChats`，跑 per-chat 令牌桶限流（5 token，1/12s 补充）。
-3. **Bot 命令分流** —— `parseCommand(msg.text)` 识别消息首词；命中 `/new`、`/provider`、`/hold`、`/state` 时由 `handleCommand` 在 bridge 内处理，**不进后端 LLM**。其他 `/xxx`（含 Claude Code 自身的 slash command）原样透传。
+3. **Bot 命令分流** —— `parseCommand(msg.text)` 识别消息首词；命中 `/help`、`/new`、`/provider`、`/hold`、`/release`、`/state`、`/model`、`/tmux` 时由 `handleCommand` 在 bridge 内处理，**不进后端 LLM**。其他 `/xxx`（含 Claude Code 自身的 slash command）原样透传。
 4. 路由到该 chat 的 `Session`。同一 chatId 的并发 create 用 `creatingChats` map 守护。新 chat 的默认后端来源优先级：`ChatStateStore.getBackend(chatId)`（持久值）> `config.defaultBackend`。
-5. `Session.backend` 是 `Backend` 接口实例，由 `createBackend(kind)` 工厂产出（`backend/index.ts`）。两种实现：
+5. `Session.backend` 是 `Backend` 接口实例，由 `createBackend(kind)` 工厂产出（`backend/index.ts`）。三种实现：
    - `ClaudeBackend` (`backend/claude.ts`) — 封装 `@anthropic-ai/claude-agent-sdk` 的 `query()`。`settingSources: ['project','user']` 让安装的插件（aria-memory）自动加载。`canUseTool` 始终 allow —— bridge 模式没有交互终端。
    - `CodexBackend` (`backend/codex.ts`) — 封装 `@openai/codex-sdk` 的 `Thread.runStreamed()`。事件粒度比 claude 粗（`item.completed` / `turn.completed`），适配为统一 `StreamMessage` 时只能产出粗粒度 `text_delta`，飞书"打字机"流式效果会退化为整段一次到位 —— codex 协议层面的 trade-off，非 lark-bridge bug。
+   - `TmuxBackend` (`backend/tmux.ts`) — 不走 SDK；对已有或新建的 tmux pane 执行 `paste-buffer` + `send-keys Enter`，再轮询 `capture-pane`。关闭 bridge session 时不 kill tmux，支持电脑端和飞书端交替接管同一 codex/claude code session。
 6. 后端流式事件分发到两类卡片：
    - `ProgressCardController` — 接 `thinking_delta` / `tool_use_start` / `tool_use_end`，`complete()` 后 15 秒自动删除。
    - `StreamingCardController` — 接 `text_delta`，`turn_complete` 时定稿。卡片 patch 失败则降级为纯文本。
@@ -57,24 +58,26 @@ cd service && npm run dev        # tsc --watch
 
 ### Backend 抽象
 
-- `service/src/backend/index.ts` 定义 `Backend` 接口、`BackendKind` 枚举（`'claude' | 'codex'`）、`StreamMessage` 协议、`createBackend(kind)` 工厂。
+- `service/src/backend/index.ts` 定义 `Backend` 接口、`BackendKind` 枚举（`'claude' | 'codex' | 'tmux'`）、`StreamMessage` 协议、`createBackend(kind)` 工厂。
 - `Backend` 接口形态故意与原 `ClaudeBridge` 一一对应：`start / pushMessage / getTurnId / interrupt / end / waitForCompletion`。SessionManager 不需要知道底层是哪个 SDK。
 - `StreamMessage` 类型是事实上的统一协议；新后端的事件适配在自己的 backend 类里完成，外部代码不变。
 - Codex 后端的特殊点：(a) 图片输入暂未桥接（SDK 的 `Input` 联合类型只接受 `text` / `local_image`-by-path，不接 base64；pushMessage 收到 images 会丢弃并 warn，未来需要桥接时把 base64 落 tmp 文件再传 path）；(b) `interrupt()` 通过 `AbortController` + `TurnOptions.signal` 实现真正的中断；(c) 鉴权依赖 codex CLI 自身（`codex login` / `CODEX_API_KEY`），lark-bridge 配置文件不管；(d) `startThread` 默认 **YOLO**：`approvalPolicy: 'never'` + `sandboxMode: 'danger-full-access'` + `networkAccessEnabled: true`，与 claude 后端 `canUseTool: allow` 等价的"全放行"——可跑 systemctl/sudo、跨目录 git/npm。安全完全下沉到 `feishu.allowedSenders` / `feishu.allowedChats`，启动时白名单宽松会 warn（见 `index.ts`）。
+- Tmux 后端默认关闭，需显式设置 `tmux.enabled=true`。特殊点：(a) turn 完成靠 `settleDelayMs` 静默启发式，不等价于 SDK result；(b) `interrupt()` 故意 no-op，因为 `/provider`、`/tmux detach` 和 daemon 关停都会调用 closeSession，不能因此向用户的 tmux pane 发 `C-c`；(c) `/tmux new` 通过 `tmux.providerCommands` 的基础命令启动 `claude` 或 `codex` CLI，并自动追加与直接后端对齐的 `model` / `effort` / `permissionMode` / `cwd` / `add-dir` / codex YOLO 参数；(d) `/tmux kill <session>` 只允许关闭当前 chat 正在接管的 tmux session。
 
 ### Bot 命令体系
 
-- `service/src/commands.ts` —— 解析消息文本。仅当首行首词命中白名单 `{new, provider, hold, state}` 时返回 `BotCommand`，否则返回 null（透传给后端）。这样保留了 Claude Code 自身的 `/init`、`/review` 这些 slash command。
-- `SessionManager.handleCommand` —— dispatch。`/new` 与 `/provider` 都走 `commandResetSession` 公共路径：关闭当前会话 → 用指定后端开新会话 → 可选 inline prompt 作为首条消息。`/provider` 还会持久化默认后端到 `chat-state.json`。
+- `service/src/commands.ts` —— 解析消息文本。仅当首行首词命中白名单 `{help, new, provider, hold, release, state, model, tmux}` 时返回 `BotCommand`，否则返回 null（透传给后端）。这样保留了 Claude Code 自身的 `/init`、`/review` 这些 slash command。
+- `SessionManager.handleCommand` —— dispatch。`/new`、`/provider` 与 `/model` 都走 `commandResetSession` 公共路径：关闭当前会话 → 用指定后端开新会话 → 可选 inline prompt 作为首条消息。`/provider` 会持久化默认后端到 `chat-state.json`；`/model` 会按当前后端持久化模型覆盖。
 - `deliverUserMessage` —— 旁路（仅 `commandResetSession` 用），把构造的 `continuationMsg` 直接送进会话路径，**跳过 allowlist / rate-limit / parseCommand**，避免无限递归。原 `/new`、`/provider` 触发消息已在 `handleMessage` 入口过 allowlist。
-- `/hold` —— 设 `session.held = true`，清掉两个 timer。仅在会话被销毁时（`/new`、`/provider`、daemon 关停）解除。
+- `/hold` —— 设 `session.held = true`，清掉两个 timer。`/release` 会恢复计时；会话被销毁时（`/new`、`/provider`、`/model`、daemon 关停）自然解除。
 - `/state` —— 纯本地读 Session 字段 + `progressCard.getSnapshot()`，**不调 LLM**，发独立简单卡片，不污染当前 turn 的 streaming card。
+- `/tmux` —— `new/attach` 会持久化 tmux target 并把 chat 默认后端设为 `tmux`；`detach` 只退出 bridge 接管，不关闭 tmux session；`list/capture/state` 都是本地 tmux 操作，不进入 LLM。
 
 ### 持久化默认后端
 
 - `service/src/chat-state.ts` —— `ChatStateStore` 类，文件 `~/.lark-bridge/chat-state.json`。
-- 启动时同步加载，`/provider` 时同步写入（tmp+rename 原子）。
-- 仅存 per-chat 默认后端，不存会话上下文 —— 切换后端不继承上下文是设计意图。
+- 启动时同步加载，`/provider` 与 `/model` 时同步写入（tmp+rename 原子）。
+- 存 per-chat 默认后端、每后端模型覆盖、tmux target，不存 SDK 会话上下文 —— 直接 SDK 后端切换不继承上下文是设计意图；tmux 后端的上下文在 tmux pane 自己的 CLI 里。
 
 ### aria-memory 集成（一个旋钮模型）
 

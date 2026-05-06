@@ -21,7 +21,7 @@ cat ~/.lark-bridge/config.json 2>/dev/null
 
 - If config exists, show current settings summary and ask:
   - **Reconfigure from scratch** — start fresh
-  - **Update specific settings** — ask which section to modify (feishu / claude / session / daemon / hooks)
+  - **Update specific settings** — ask which section to modify (feishu / claude / codex / tmux / session / daemon / hooks)
 - If no config exists, proceed to Step 1.
 
 ## Step 1: Feishu App Credentials
@@ -55,26 +55,46 @@ Ask:
 ### 2b. Claude backend settings
 
 1. **Claude model** — present options:
-   - `sonnet` (Recommended) — balanced speed and capability
-   - `opus` — most capable, slower
+   - `opus` (Recommended) — most capable, slower
+   - `sonnet` — balanced speed and capability
    - `haiku` — fastest, lighter tasks
 
-2. **Permission mode** — present options（提示用户：`canUseTool` 回调对所有工具永远 allow，所以不论选哪档 Claude 实际都能跑任意命令；这里更多是模型的行为风格选择）：
+2. **Claude effort** — present options:
+   - `max` (Recommended) — maximum reasoning depth for bridge use
+   - `high`
+   - `medium`
+   - `low`
+
+3. **Permission mode** — present options（提示用户：`canUseTool` 回调对所有工具永远 allow，所以不论选哪档 Claude 实际都能跑任意命令；这里更多是模型的行为风格选择）：
    - `auto` (Recommended) — Claude 主动执行，与 codex 后端 YOLO（`approvalPolicy: never` + `sandboxMode: danger-full-access`）能力对等
    - `acceptEdits` — 模型行为偏向自动接受编辑、其它先问（bridge 模式没人答，多数情况下也直接执行）
    - `plan` — 模型仅提议方案不直接动手（bridge 模式没人按"确认"，会卡住，不建议）
    - `bypassPermissions` — 显式跳过权限层（show warning）
    - `default` — 标准 Claude Code 权限
 
-3. **Workspace root** — text input with default `~/workspace/lark-bridge`. This is where per-chat working directories are created. **Codex sessions share the same workspace** —— per-chat 子目录由两个后端共用。
+4. **Workspace root** — text input with default `~/workspace/lark-bridge`. This is where per-chat working directories are created. **Codex sessions share the same workspace** —— per-chat 子目录由两个后端共用。
 
-4. **Additional directories** — text input, comma-separated paths. Empty to skip.
+5. **Additional directories** — text input, comma-separated paths. Empty to skip.
 
 ### 2c. Codex backend settings (only if codex was selected as default OR user wants to use it later)
 
-1. **Codex model** — text input with default `gpt-5-codex`. 留空使用 SDK 默认。
+1. **Codex model** — text input with default `gpt-5.5`.
+2. **Codex reasoning effort** — default `xhigh`; options `minimal | low | medium | high | xhigh`.
 
 提示用户：codex 鉴权不在配置文件里设置——需要在 host 上预先运行 `codex login` 完成 OAuth，或导出 `CODEX_API_KEY` 环境变量。
+
+### 2d. tmux handoff settings
+
+Ask whether to enable tmux handoff:
+
+1. **tmux 接管** — 选项：
+   - **Disable**（默认）—— 不启用 tmux 后端，避免把 host 上 tmux pane 的输入/输出权限暴露给飞书侧
+   - **Enable** —— 支持飞书侧 `/tmux new|attach|detach|ls|list|capture|state`
+
+2. If enabled, ask:
+   - **Default tmux provider** — `codex`（推荐）或 `claude`，用于 `/tmux new <session>` 未显式指定 provider 时
+   - **Provider commands** — 默认 `claude` / `codex`。这里只配置基础命令或包装脚本名；lark-bridge 会自动追加与直接后端对齐的 model / permission / cwd / add-dir / codex YOLO 参数。
+   - **Capture settle delay** — 默认 15000ms。说明：tmux 后端无法知道 CLI 真正 turn_complete，只能在 pane 输出静默一段时间后认为本轮完成。
 
 ## Step 3: Session Settings
 
@@ -130,7 +150,7 @@ Config mapping:
 
 ## Step 6: Write Configuration
 
-Assemble the final config.json from all collected answers. Convert timeout/duration selections to milliseconds.
+Assemble the final config.json from all collected answers. Convert timeout/duration selections to milliseconds, and include a `tmux` block when tmux handoff is enabled.
 
 ```bash
 mkdir -p ~/.lark-bridge

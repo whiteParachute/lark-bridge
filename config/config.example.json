@@ -7,14 +7,28 @@
   },
   "defaultBackend": "claude",
   "claude": {
-    "model": "sonnet",
+    "model": "opus",
+    "effort": "max",
     "workspaceRoot": "~/workspace/lark-bridge",
     "additionalDirectories": [],
     "allowAllDirectories": false,
     "permissionMode": "auto"
   },
   "codex": {
-    "model": "gpt-5-codex"
+    "model": "gpt-5.5",
+    "modelReasoningEffort": "xhigh"
+  },
+  "tmux": {
+    "enabled": false,
+    "defaultProvider": "codex",
+    "providerCommands": {
+      "claude": "claude",
+      "codex": "codex"
+    },
+    "captureLines": 200,
+    "pollIntervalMs": 1000,
+    "settleDelayMs": 15000,
+    "turnTimeoutMs": 1200000
   },
   "session": {
     "idleTimeoutMs": 1800000,
