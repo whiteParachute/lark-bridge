@@ -320,6 +320,8 @@ claude 会追加 `--model`、`--effort`、`--permission-mode`、`--add-dir`。`t
 
 tmux 后端没有 SDK turn-complete 事件，只能在 pane 输出静默 `settleDelayMs` 后认为本轮完成；这同样适用于 attach 后的只读观察轮和飞书侧下发的新请求。普通消息会串行投递：上一轮未稳定时，新消息不会提前写 transcript / 跑 `message.pre` hooks / paste 到 pane。飞书消息末尾的 CR/LF 会在发送到 tmux 前剥掉，避免把“发送消息的回车”当成 TUI 输入框里的正文换行；正文内部换行仍保留。单行消息使用 `tmux send-keys -l` 输入，短暂等待 TUI 消化后再提交；如果随后抓到同一条文本仍停在输入区，会再重试一次 Enter。多行消息才使用 `paste-buffer`。
 
+飞书侧会把 tmux 执行拆成两类消息：执行中只更新临时处理卡片；输出静默后再发送一张“tmux 返回结果”卡片。结果卡片只抽取本轮输入开始后的 pane 内容，剥掉底部 composer，并在发送前脱敏邮箱地址、限制最大长度，避免把长历史或会触发飞书审核的账号信息发回群里。
+
 权限：bot 命令复用 `feishu.allowedSenders` / `allowedChats` 白名单，没有独立权限层。
 
 ### Claude Code 侧（仅在装了 Claude Code 时）

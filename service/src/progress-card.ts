@@ -82,7 +82,7 @@ function buildProgressCard(
       ? '✅ 处理完成'
       : state === 'aborted'
         ? '⚠️ 已中断'
-        : '🤔 正在思考...';
+        : '⏳ 正在处理...';
 
   return {
     config: { wide_screen_mode: true, update_multi: true },

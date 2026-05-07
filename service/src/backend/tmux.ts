@@ -23,10 +23,12 @@ export interface TmuxSessionInfo {
 }
 
 const MAX_OUTPUT_CHARS = 12_000;
+const MAX_RESULT_CHARS = 5000;
 const TMUX_SINGLE_LINE_LIMIT = 4000;
 const TMUX_SUBMIT_DELAY_MS = 100;
 const TMUX_SUBMIT_RETRY_DELAY_MS = 250;
 const TMUX_PENDING_CAPTURE_LINES = 30;
+const TMUX_PROGRESS_INTERVAL_MS = 2500;
 
 export class TmuxBackend implements Backend {
   private target = '';
@@ -124,9 +126,16 @@ export class TmuxBackend implements Backend {
     }
 
     let latest = before;
-    let emitted = '';
+    let observedOutput = '';
     let lastChangedAt = Date.now();
+    let lastProgressAt = 0;
     const deadline = Date.now() + this.turnTimeoutMs;
+
+    emit({ type: 'tool_use_start', toolName: `tmux:${this.target}` });
+    emit({
+      type: 'thinking_delta',
+      text: `tmux \`${this.target}\`：已发送输入，等待 pane 输出稳定。`,
+    });
 
     while (!this.done && Date.now() < deadline) {
       await sleep(this.pollIntervalMs);
@@ -141,19 +150,27 @@ export class TmuxBackend implements Backend {
       if (nextCapture !== latest) {
         latest = nextCapture;
         lastChangedAt = Date.now();
-        const delta = clipOutput(extractPaneDelta(before, latest));
-        if (delta && delta !== emitted) {
-          emitted = delta;
-          emit({ type: 'text_delta', text: emitted });
+        observedOutput = extractTurnOutput(before, latest, input.text);
+        const now = Date.now();
+        if (observedOutput && now - lastProgressAt >= TMUX_PROGRESS_INTERVAL_MS) {
+          lastProgressAt = now;
+          emit({
+            type: 'thinking_delta',
+            text: `tmux \`${this.target}\`：捕获到新输出，继续等待静默 ${Math.round(
+              this.settleDelayMs / 1000,
+            )} 秒后返回最终结果。`,
+          });
         }
       }
 
       if (Date.now() - lastChangedAt >= this.settleDelayMs) break;
     }
 
-    const finalText =
-      emitted ||
-      `已发送到 tmux \`${this.target}\`，${Math.round(
+    const finalOutput = observedOutput || extractTurnOutput(before, latest, input.text);
+    emit({ type: 'tool_use_end', toolName: `tmux:${this.target}` });
+    const finalText = finalOutput
+      ? formatTmuxResult(this.target, input.text, finalOutput)
+      : `**tmux 已发送**\n目标：\`${this.target}\`\n\n已发送到 tmux，${Math.round(
         this.settleDelayMs / 1000,
       )} 秒内暂无新输出。`;
     emit({ type: 'turn_complete', text: finalText });
@@ -366,6 +383,92 @@ function isInputStillPending(capture: string, pendingText: string): boolean {
     .split('\n')
     .slice(-8)
     .some((line) => line.trim() === `› ${firstLine}`);
+}
+
+function formatTmuxResult(
+  target: string,
+  inputText: string,
+  output: string,
+): string {
+  const input = redactTmuxOutput(normalizeTmuxInput(inputText).trim());
+  const result = clipResult(redactTmuxOutput(output.trim()));
+  const lines = [
+    '**tmux 返回结果**',
+    `目标：\`${target}\``,
+    input ? `输入：\`${escapeInlineCode(input)}\`` : '',
+    '',
+    '```text',
+    result,
+    '```',
+  ];
+  return lines.filter((line, idx) => line || idx === 3).join('\n');
+}
+
+function extractTurnOutput(before: string, after: string, inputText: string): string {
+  const cleanAfter = stripTrailingComposer(after).trim();
+  if (!cleanAfter) return '';
+
+  const markerOutput = extractFromInputMarker(cleanAfter, inputText);
+  if (markerOutput) return markerOutput;
+
+  return stripTrailingComposer(extractPaneDelta(before, cleanAfter)).trim();
+}
+
+function extractFromInputMarker(capture: string, inputText: string): string {
+  const normalizedInput = normalizeTmuxInput(inputText).trim();
+  const firstLine = normalizedInput.split('\n').find((line) => line.trim())?.trim();
+  if (!firstLine) return '';
+
+  const lines = capture.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (trimmed === firstLine || trimmed === `› ${firstLine}`) {
+      return lines.slice(i).join('\n').trim();
+    }
+  }
+  return '';
+}
+
+function stripTrailingComposer(text: string): string {
+  const lines = text.split('\n');
+  let end = lines.length;
+  while (end > 0 && !lines[end - 1].trim()) end--;
+  if (end <= 0) return '';
+
+  const statusIdx = end - 1;
+  if (!isComposerStatusLine(lines[statusIdx])) {
+    return lines.slice(0, end).join('\n');
+  }
+
+  let promptIdx = statusIdx - 1;
+  while (promptIdx >= 0 && !lines[promptIdx].trim()) promptIdx--;
+  if (promptIdx >= 0 && lines[promptIdx].trim().startsWith('› ')) {
+    return lines.slice(0, promptIdx).join('\n').trimEnd();
+  }
+
+  return lines.slice(0, end).join('\n');
+}
+
+function isComposerStatusLine(line: string): boolean {
+  return /\b(?:gpt|claude|opus|sonnet|haiku)[\w.-]*\b/i.test(line) && line.includes(' · /');
+}
+
+function redactTmuxOutput(text: string): string {
+  return text.replace(
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
+    '[redacted-email]',
+  );
+}
+
+function escapeInlineCode(text: string): string {
+  return text.replace(/`/g, '\\`').replace(/\n+/g, ' / ');
+}
+
+function clipResult(text: string): string {
+  if (text.length <= MAX_RESULT_CHARS) return text;
+  return `…（已截断，仅显示最近 ${MAX_RESULT_CHARS} 字符）\n${text.slice(
+    text.length - MAX_RESULT_CHARS,
+  )}`;
 }
 
 function extractPaneDelta(before: string, after: string): string {
