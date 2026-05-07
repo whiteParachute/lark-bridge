@@ -23,6 +23,10 @@ export interface TmuxSessionInfo {
 }
 
 const MAX_OUTPUT_CHARS = 12_000;
+const TMUX_SINGLE_LINE_LIMIT = 4000;
+const TMUX_SUBMIT_DELAY_MS = 100;
+const TMUX_SUBMIT_RETRY_DELAY_MS = 250;
+const TMUX_PENDING_CAPTURE_LINES = 30;
 
 export class TmuxBackend implements Backend {
   private target = '';
@@ -315,9 +319,9 @@ async function pasteToTmux(target: string, text: string): Promise<void> {
   const normalizedText = normalizeTmuxInput(text);
   if (!normalizedText) return;
 
-  if (!normalizedText.includes('\n') && normalizedText.length <= 4000) {
+  if (!normalizedText.includes('\n') && normalizedText.length <= TMUX_SINGLE_LINE_LIMIT) {
     await runTmux(['send-keys', '-t', target, '-l', normalizedText]);
-    await submitTmuxInput(target);
+    await submitTmuxInput(target, normalizedText);
     return;
   }
 
@@ -332,8 +336,36 @@ function normalizeTmuxInput(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+$/g, '');
 }
 
-async function submitTmuxInput(target: string): Promise<void> {
+async function submitTmuxInput(
+  target: string,
+  pendingText?: string,
+): Promise<void> {
+  await sleep(TMUX_SUBMIT_DELAY_MS);
   await runTmux(['send-keys', '-t', target, 'Enter']);
+
+  if (!pendingText || pendingText.length > 500) return;
+
+  await sleep(TMUX_SUBMIT_RETRY_DELAY_MS);
+  const capture = await captureTmuxTarget(target, TMUX_PENDING_CAPTURE_LINES).catch(
+    () => '',
+  );
+  if (!isInputStillPending(capture, pendingText)) return;
+
+  logger.warn(
+    { target, chars: pendingText.length },
+    'tmux input still pending after submit; retrying Enter',
+  );
+  await runTmux(['send-keys', '-t', target, 'Enter']);
+}
+
+function isInputStillPending(capture: string, pendingText: string): boolean {
+  const firstLine = pendingText.split('\n')[0]?.trim();
+  if (!firstLine) return false;
+
+  return capture
+    .split('\n')
+    .slice(-8)
+    .some((line) => line.trim() === `› ${firstLine}`);
 }
 
 function extractPaneDelta(before: string, after: string): string {
