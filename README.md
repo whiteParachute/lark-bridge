@@ -312,7 +312,7 @@ tmux 默认关闭，需在配置里显式设置 `"tmux": { "enabled": true, ... 
 
 tmux 接管不会 kill pane：`/provider claude|codex` 或 `/tmux detach` 只关闭飞书侧桥接会话，tmux 中的 codex/claude code 仍保持运行。电脑端接手时直接执行 `tmux attach -t <session>`。
 
-`/tmux attach` 和 tmux session 启动会先进入只读观察轮：bridge 不发送输入，只轮询 `capture-pane` 并把当前 pane 输出流式刷新到飞书卡片；直到输出静默 `settleDelayMs` 后才认为观察轮完成。观察轮标记为 observation：会显示给飞书侧，但不写 assistant transcript，也不触发 `message.post` hooks。观察轮未完成时收到新的普通消息，bridge 会按队列等待观察轮结束，再把这条消息 paste 到同一个 pane。这样可以降低把新请求打进仍在输出的 TUI 的概率，同时保证不切换 provider 时，飞书侧后续输入都接在 tmux pane 内原有 CLI 上下文之后。
+`/tmux attach` 和 tmux session 启动会先进入只读观察轮：bridge 不发送输入，只轮询 `capture-pane` 并把当前 pane 输出流式刷新到飞书卡片。观察轮标记为 observation：会显示给飞书侧，但不写 assistant transcript，也不触发 `message.post` hooks。观察轮优先看 TUI 状态：pane 已回到底部 composer 时会快速完成并放行排队输入；pane 仍在 `Working` / `esc to interrupt` / MCP 启动状态时继续等待。观察未完成时收到新的普通消息，bridge 会按队列等待观察轮结束，再把这条消息 paste 到同一个 pane。这样可以降低把新请求打进仍在输出的 TUI 的概率，同时保证不切换 provider 时，飞书侧后续输入都接在 tmux pane 内原有 CLI 上下文之后。
 
 `/tmux new` 会在 `tmux.providerCommands` 的基础命令后自动追加与直接后端对齐的启动参数：
 codex 会追加 `--model`、`--config model_reasoning_effort=...`、`--dangerously-bypass-approvals-and-sandbox`、`--cd`、`--add-dir`；
@@ -396,7 +396,7 @@ Daemon 在 session 和 message 生命周期提供 4 个 hook 插槽：
 | 中断当前 turn | ✅ `query.interrupt()` | ✅ `AbortController.abort()`（via `TurnOptions.signal`） |
 | 加载 Claude Code 插件 | ✅ `settingSources: ['project','user']` | ❌ |
 
-tmux 后端不走 SDK，也不解析真实 turn 完成事件。它启动或 attach 后会先只读观察当前 pane 输出；飞书侧发送普通消息时才把输入 paste 到 pane，然后继续轮询 `capture-pane`。观察轮只显示当前 pane 状态，不写 assistant transcript、不触发 `message.post` hooks；普通输入轮会正常进入 transcript/hooks。任一轮在 `settleDelayMs` 时间内无新输出时被视为完成；关闭 bridge session 时不会向 pane 发送 `C-c`，避免误杀电脑端正在运行的任务。
+tmux 后端不走 SDK，也不解析真实 turn 完成事件。它启动或 attach 后会先只读观察当前 pane 输出；飞书侧发送普通消息时才把输入 paste 到 pane，然后继续轮询 `capture-pane`。观察轮只显示当前 pane 状态，不写 assistant transcript、不触发 `message.post` hooks；普通输入轮会正常进入 transcript/hooks。完成判断优先看 TUI ready/busy 状态，`settleDelayMs` 只作为兜底静默时间；关闭 bridge session 时不会向 pane 发送 `C-c`，避免误杀电脑端正在运行的任务。
 
 ## 前置条件
 
