@@ -47,7 +47,7 @@ cd service && npm run dev        # tsc --watch
 5. `Session.backend` 是 `Backend` 接口实例，由 `createBackend(kind)` 工厂产出（`backend/index.ts`）。三种实现：
    - `ClaudeBackend` (`backend/claude.ts`) — 封装 `@anthropic-ai/claude-agent-sdk` 的 `query()`。`settingSources: ['project','user']` 让安装的插件（aria-memory）自动加载。`canUseTool` 始终 allow —— bridge 模式没有交互终端。
    - `CodexBackend` (`backend/codex.ts`) — 封装 `@openai/codex-sdk` 的 `Thread.runStreamed()`。事件粒度比 claude 粗（`item.completed` / `turn.completed`），适配为统一 `StreamMessage` 时只能产出粗粒度 `text_delta`，飞书"打字机"流式效果会退化为整段一次到位 —— codex 协议层面的 trade-off，非 lark-bridge bug。
-   - `TmuxBackend` (`backend/tmux.ts`) — 不走 SDK；启动/attach 后先只读观察当前 pane 输出，飞书侧普通消息会先剥掉末尾 CR/LF；单行输入用 `send-keys -l` 逐字输入，短暂等待后提交，并在检测到输入仍停在 composer 时重试一次 Enter；多行输入才用 `paste-buffer`，再轮询 `capture-pane`。普通输入轮只用临时进度卡展示“执行中”，最终卡片只抽取本轮输入后的 pane 内容，并在发回飞书前脱敏邮箱、限制长度、剥掉底部 composer。关闭 bridge session 时不 kill tmux，支持电脑端和飞书端交替接管同一 codex/claude code session。
+   - `TmuxBackend` (`backend/tmux.ts`) — 不走 SDK；启动/attach 后先只读观察当前 pane 输出，飞书侧普通消息会先剥掉末尾 CR/LF；单行输入用 `send-keys -l` 逐字输入，短暂等待后提交，并在检测到输入仍停在 composer 时重试一次 Enter；多行输入才用 `paste-buffer`。输入后的前几秒快速轮询 `capture-pane`，优先用 TUI 状态判定完成：底部 composer 回来就快速收尾，`Working` / `esc to interrupt` / MCP 启动状态仍存在就继续等待，`settleDelayMs` 只做兜底。普通输入轮只用临时进度卡展示“执行中”，最终卡片只抽取本轮输入后的 pane 内容，并在发回飞书前脱敏邮箱、限制长度、剥掉底部 composer。关闭 bridge session 时不 kill tmux，支持电脑端和飞书端交替接管同一 codex/claude code session。
 6. 后端流式事件分发到两类卡片：
    - `ProgressCardController` — 接 `thinking_delta` / `tool_use_start` / `tool_use_end`，`complete()` 后 15 秒自动删除。
    - `StreamingCardController` — 接 `text_delta`，`turn_complete` 时定稿；若后端只发 `turn_complete`，会直接创建最终卡片。卡片 patch 失败则降级为纯文本。

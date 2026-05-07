@@ -212,8 +212,8 @@ cp config/config.example.json ~/.lark-bridge/config.json
       "codex": "codex"               // 基础命令；bridge 会追加 model/cwd/add-dir/YOLO
     },
     "captureLines": 200,              // 每次 capture-pane 读取的行数
-    "pollIntervalMs": 1000,           // 发送消息后轮询 pane 的间隔
-    "settleDelayMs": 15000,           // 多少毫秒无新输出后认为本轮完成
+    "pollIntervalMs": 1000,           // 常规轮询间隔；输入后的前几秒会自动加速轮询
+    "settleDelayMs": 15000,           // 兜底静默时间；优先用 TUI ready/busy 状态判断完成
     "turnTimeoutMs": 1200000          // 单轮最长观察时间
   },
   "session": {
@@ -318,7 +318,7 @@ tmux 接管不会 kill pane：`/provider claude|codex` 或 `/tmux detach` 只关
 codex 会追加 `--model`、`--config model_reasoning_effort=...`、`--dangerously-bypass-approvals-and-sandbox`、`--cd`、`--add-dir`；
 claude 会追加 `--model`、`--effort`、`--permission-mode`、`--add-dir`。`tmux.providerCommands` 只用于配置基础命令或包装脚本名。
 
-tmux 后端没有 SDK turn-complete 事件，只能在 pane 输出静默 `settleDelayMs` 后认为本轮完成；这同样适用于 attach 后的只读观察轮和飞书侧下发的新请求。普通消息会串行投递：上一轮未稳定时，新消息不会提前写 transcript / 跑 `message.pre` hooks / paste 到 pane。飞书消息末尾的 CR/LF 会在发送到 tmux 前剥掉，避免把“发送消息的回车”当成 TUI 输入框里的正文换行；正文内部换行仍保留。单行消息使用 `tmux send-keys -l` 输入，短暂等待 TUI 消化后再提交；如果随后抓到同一条文本仍停在输入区，会再重试一次 Enter。多行消息才使用 `paste-buffer`。
+tmux 后端没有 SDK turn-complete 事件，因此完成判断优先看 TUI 状态：如果底部 composer 回来，说明简单命令已结束，会在短暂稳定后马上返回；如果 pane 仍显示 `Working` / `esc to interrupt` / MCP 启动状态，则继续等待，不会因为 `settleDelayMs` 静默而提前结束。`settleDelayMs` 只作为识别不到 TUI 状态时的兜底。普通消息会串行投递：上一轮未稳定时，新消息不会提前写 transcript / 跑 `message.pre` hooks / paste 到 pane。飞书消息末尾的 CR/LF 会在发送到 tmux 前剥掉，避免把“发送消息的回车”当成 TUI 输入框里的正文换行；正文内部换行仍保留。单行消息使用 `tmux send-keys -l` 输入，短暂等待 TUI 消化后再提交；如果随后抓到同一条文本仍停在输入区，会再重试一次 Enter。多行消息才使用 `paste-buffer`。输入后的前 5 秒会用更快的轮询间隔观察 pane，降低简单命令的等待时间；attach/daemon 重启后的只读观察如果看到 pane 已空闲，也会快速放行排队输入。
 
 飞书侧会把 tmux 执行拆成两类消息：执行中只更新临时处理卡片；输出静默后再发送一张“tmux 返回结果”卡片。结果卡片只抽取本轮输入开始后的 pane 内容，剥掉底部 composer，并在发送前脱敏邮箱地址、限制最大长度，避免把长历史或会触发飞书审核的账号信息发回群里。
 

@@ -29,6 +29,10 @@ const TMUX_SUBMIT_DELAY_MS = 100;
 const TMUX_SUBMIT_RETRY_DELAY_MS = 250;
 const TMUX_PENDING_CAPTURE_LINES = 30;
 const TMUX_PROGRESS_INTERVAL_MS = 2500;
+const TMUX_FAST_POLL_WINDOW_MS = 5000;
+const TMUX_FAST_POLL_INTERVAL_MS = 250;
+const TMUX_READY_SETTLE_MS = 500;
+const TMUX_OBSERVE_IDLE_MS = 1000;
 
 export class TmuxBackend implements Backend {
   private target = '';
@@ -129,6 +133,8 @@ export class TmuxBackend implements Backend {
     let observedOutput = '';
     let lastChangedAt = Date.now();
     let lastProgressAt = 0;
+    let readySince: number | null = null;
+    const sentAt = Date.now();
     const deadline = Date.now() + this.turnTimeoutMs;
 
     emit({ type: 'tool_use_start', toolName: `tmux:${this.target}` });
@@ -138,7 +144,7 @@ export class TmuxBackend implements Backend {
     });
 
     while (!this.done && Date.now() < deadline) {
-      await sleep(this.pollIntervalMs);
+      await sleep(this.pollDelay(sentAt));
       const nextCapture = await captureTmuxTarget(
         this.target,
         this.captureLines,
@@ -156,14 +162,33 @@ export class TmuxBackend implements Backend {
           lastProgressAt = now;
           emit({
             type: 'thinking_delta',
-            text: `tmux \`${this.target}\`：捕获到新输出，继续等待静默 ${Math.round(
-              this.settleDelayMs / 1000,
-            )} 秒后返回最终结果。`,
+            text: `tmux \`${this.target}\`：捕获到新输出，等待 TUI 空闲后返回最终结果。`,
           });
         }
       }
 
-      if (Date.now() - lastChangedAt >= this.settleDelayMs) break;
+      const now = Date.now();
+      const state = getPaneRuntimeState(latest, input.text);
+      if (state.busy) {
+        readySince = null;
+        if (now - lastProgressAt >= TMUX_PROGRESS_INTERVAL_MS) {
+          lastProgressAt = now;
+          emit({
+            type: 'thinking_delta',
+            text: `tmux \`${this.target}\`：pane 仍在运行，等待完成。`,
+          });
+        }
+        continue;
+      }
+
+      if (state.ready) {
+        readySince ??= now;
+        if (now - readySince >= TMUX_READY_SETTLE_MS) break;
+        continue;
+      }
+
+      readySince = null;
+      if (now - lastChangedAt >= this.settleDelayMs) break;
     }
 
     const finalOutput = observedOutput || extractTurnOutput(before, latest, input.text);
@@ -192,6 +217,8 @@ export class TmuxBackend implements Backend {
     );
     let emitted = clipOutput(latest.trim());
     let lastChangedAt = Date.now();
+    let lastProgressAt = 0;
+    const startedAt = Date.now();
     const deadline = Date.now() + this.turnTimeoutMs;
 
     if (emitted) {
@@ -199,7 +226,10 @@ export class TmuxBackend implements Backend {
     }
 
     while (!this.done && Date.now() < deadline) {
-      await sleep(this.pollIntervalMs);
+      const initialState = getPaneRuntimeState(latest);
+      if (initialState.ready && !initialState.busy) break;
+
+      await sleep(this.pollDelay(startedAt));
       const nextCapture = await captureTmuxTarget(
         this.target,
         this.captureLines,
@@ -218,7 +248,23 @@ export class TmuxBackend implements Backend {
         }
       }
 
-      if (Date.now() - lastChangedAt >= this.settleDelayMs) break;
+      const now = Date.now();
+      const state = getPaneRuntimeState(latest);
+      if (state.ready && !state.busy) break;
+      if (state.busy) {
+        if (now - lastProgressAt >= TMUX_PROGRESS_INTERVAL_MS) {
+          lastProgressAt = now;
+          emit({
+            type: 'thinking_delta',
+            text: `tmux \`${this.target}\`：当前 pane 仍在运行，接管输入会等待它完成。`,
+          });
+        }
+        continue;
+      }
+
+      if (now - lastChangedAt >= Math.min(this.settleDelayMs, TMUX_OBSERVE_IDLE_MS)) {
+        break;
+      }
     }
 
     const finalText =
@@ -239,6 +285,13 @@ export class TmuxBackend implements Backend {
 
   getTurnId(): number {
     return this.currentTurnId;
+  }
+
+  private pollDelay(referenceTime: number): number {
+    if (Date.now() - referenceTime <= TMUX_FAST_POLL_WINDOW_MS) {
+      return Math.min(this.pollIntervalMs, TMUX_FAST_POLL_INTERVAL_MS);
+    }
+    return this.pollIntervalMs;
   }
 
   async interrupt(): Promise<void> {
@@ -429,24 +482,75 @@ function extractFromInputMarker(capture: string, inputText: string): string {
   return '';
 }
 
+function getPaneRuntimeState(
+  capture: string,
+  inputText?: string,
+): { ready: boolean; busy: boolean } {
+  const lines = capture.split('\n');
+  const composerStart = findTrailingComposerStart(lines);
+  const ready = composerStart >= 0;
+  const relevantText = inputText
+    ? relevantSliceAfterInput(lines, inputText).join('\n')
+    : lines.slice(Math.max(0, lines.length - 30)).join('\n');
+  const busy = isPaneBusy(relevantText);
+  return { ready: ready && !busy, busy };
+}
+
+function relevantSliceAfterInput(lines: string[], inputText: string): string[] {
+  const normalizedInput = normalizeTmuxInput(inputText).trim();
+  const firstLine = normalizedInput.split('\n').find((line) => line.trim())?.trim();
+  if (!firstLine) return lines.slice(Math.max(0, lines.length - 30));
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (trimmed === firstLine || trimmed === `› ${firstLine}`) {
+      return lines.slice(i);
+    }
+  }
+
+  return lines.slice(Math.max(0, lines.length - 30));
+}
+
+function isPaneBusy(text: string): boolean {
+  return (
+    /\bWorking\s*\(/i.test(text) ||
+    /\bRunning\s*\(/i.test(text) ||
+    /\bThinking\s*\(/i.test(text) ||
+    /esc to interrupt/i.test(text) ||
+    /Starting MCP servers/i.test(text) ||
+    /Booting MCP server/i.test(text)
+  );
+}
+
 function stripTrailingComposer(text: string): string {
   const lines = text.split('\n');
   let end = lines.length;
   while (end > 0 && !lines[end - 1].trim()) end--;
   if (end <= 0) return '';
 
-  const statusIdx = end - 1;
-  if (!isComposerStatusLine(lines[statusIdx])) {
+  const composerStart = findTrailingComposerStart(lines.slice(0, end));
+  if (composerStart < 0) {
     return lines.slice(0, end).join('\n');
   }
+
+  return lines.slice(0, composerStart).join('\n').trimEnd();
+}
+
+function findTrailingComposerStart(lines: string[]): number {
+  let end = lines.length;
+  while (end > 0 && !lines[end - 1].trim()) end--;
+  if (end <= 0) return -1;
+
+  const statusIdx = end - 1;
+  if (!isComposerStatusLine(lines[statusIdx])) return -1;
 
   let promptIdx = statusIdx - 1;
   while (promptIdx >= 0 && !lines[promptIdx].trim()) promptIdx--;
   if (promptIdx >= 0 && lines[promptIdx].trim().startsWith('› ')) {
-    return lines.slice(0, promptIdx).join('\n').trimEnd();
+    return promptIdx;
   }
 
-  return lines.slice(0, end).join('\n');
+  return -1;
 }
 
 function isComposerStatusLine(line: string): boolean {
