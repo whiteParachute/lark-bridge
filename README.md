@@ -320,7 +320,7 @@ claude 会追加 `--model`、`--effort`、`--permission-mode`、`--add-dir`。`t
 
 tmux 后端没有 SDK turn-complete 事件，因此完成判断优先看 TUI 状态：如果底部 composer 回来，说明简单命令已结束，会在短暂稳定后马上返回；如果 pane 仍显示 `Working` / `esc to interrupt` / MCP 启动状态，则继续等待，不会因为 `settleDelayMs` 静默而提前结束。`settleDelayMs` 只作为识别不到 TUI 状态时的兜底。普通消息会串行投递：上一轮未稳定时，新消息不会提前写 transcript / 跑 `message.pre` hooks / paste 到 pane。飞书消息末尾的 CR/LF 会在发送到 tmux 前剥掉，避免把“发送消息的回车”当成 TUI 输入框里的正文换行；正文内部换行仍保留。单行消息使用 `tmux send-keys -l` 输入，短暂等待 TUI 消化后再提交；如果随后抓到同一条文本仍停在输入区，会再重试一次 Enter。多行消息才使用 `paste-buffer`。输入后的前 5 秒会用更快的轮询间隔观察 pane，降低简单命令的等待时间；attach/daemon 重启后的只读观察如果看到 pane 已空闲，也会快速放行排队输入。
 
-飞书侧会把 tmux 执行拆成两类消息：执行中只更新临时处理卡片；输出静默后再发送一张“tmux 返回结果”卡片。结果卡片只抽取本轮输入开始后的 pane 内容，剥掉底部 composer，并在发送前脱敏邮箱地址、限制最大长度，避免把长历史或会触发飞书审核的账号信息发回群里。
+飞书侧会把 tmux 执行拆成两类消息：执行中只更新临时处理卡片；输出静默后再发送一张“tmux 返回结果”卡片。结果卡片只抽取本轮输入开始后的 pane 内容，剥掉底部 composer，并在发送前脱敏邮箱地址、限制最大长度，避免把长历史或会触发飞书审核的账号信息发回群里。Claude TUI 输出会进一步整理：底部 HUD 归并成“Claude HUD / 状态摘要”，`Edit`/`Update` 的具体 diff 不展示，只把工具调用类型和计数送到临时进度卡与最终工具概览。
 
 权限：bot 命令复用 `feishu.allowedSenders` / `allowedChats` 白名单，没有独立权限层。
 

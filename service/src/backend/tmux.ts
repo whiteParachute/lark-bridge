@@ -15,6 +15,11 @@ interface QueuedInput {
   images?: Array<{ data: string; mimeType: string }>;
 }
 
+interface TmuxDisplay {
+  text: string;
+  toolNames: string[];
+}
+
 export interface TmuxSessionInfo {
   name: string;
   windows: string;
@@ -33,6 +38,8 @@ const TMUX_FAST_POLL_WINDOW_MS = 5000;
 const TMUX_FAST_POLL_INTERVAL_MS = 250;
 const TMUX_READY_SETTLE_MS = 500;
 const TMUX_OBSERVE_IDLE_MS = 1000;
+const MAX_SUMMARY_TOOLS = 12;
+const MAX_HUD_LINES = 12;
 
 export class TmuxBackend implements Backend {
   private target = '';
@@ -134,6 +141,7 @@ export class TmuxBackend implements Backend {
     let lastChangedAt = Date.now();
     let lastProgressAt = 0;
     let readySince: number | null = null;
+    const emittedTools = new Set<string>();
     const sentAt = Date.now();
     const deadline = Date.now() + this.turnTimeoutMs;
 
@@ -157,6 +165,14 @@ export class TmuxBackend implements Backend {
         latest = nextCapture;
         lastChangedAt = Date.now();
         observedOutput = extractTurnOutput(before, latest, input.text);
+        emitToolSummaries(
+          summarizeTmuxDisplay(this.target, observedOutput, {
+            mode: 'result',
+            inputText: input.text,
+          }).toolNames,
+          emittedTools,
+          emit,
+        );
         const now = Date.now();
         if (observedOutput && now - lastProgressAt >= TMUX_PROGRESS_INTERVAL_MS) {
           lastProgressAt = now;
@@ -192,9 +208,18 @@ export class TmuxBackend implements Backend {
     }
 
     const finalOutput = observedOutput || extractTurnOutput(before, latest, input.text);
+    const finalDisplay = finalOutput
+      ? summarizeTmuxDisplay(this.target, finalOutput, {
+          mode: 'result',
+          inputText: input.text,
+        })
+      : null;
+    if (finalDisplay) {
+      emitToolSummaries(finalDisplay.toolNames, emittedTools, emit);
+    }
     emit({ type: 'tool_use_end', toolName: `tmux:${this.target}` });
-    const finalText = finalOutput
-      ? formatTmuxResult(this.target, input.text, finalOutput)
+    const finalText = finalDisplay
+      ? finalDisplay.text
       : `**tmux 已发送**\n目标：\`${this.target}\`\n\n已发送到 tmux，${Math.round(
         this.settleDelayMs / 1000,
       )} 秒内暂无新输出。`;
@@ -215,13 +240,16 @@ export class TmuxBackend implements Backend {
         return '';
       },
     );
-    let emitted = clipOutput(latest.trim());
+    const emittedTools = new Set<string>();
+    let display = summarizeTmuxDisplay(this.target, latest, { mode: 'observe' });
+    let emitted = display.text;
     let lastChangedAt = Date.now();
     let lastProgressAt = 0;
     const startedAt = Date.now();
     const deadline = Date.now() + this.turnTimeoutMs;
 
     if (emitted) {
+      emitToolSummaries(display.toolNames, emittedTools, emit);
       emit({ type: 'text_delta', text: emitted });
     }
 
@@ -241,7 +269,9 @@ export class TmuxBackend implements Backend {
       if (nextCapture !== latest) {
         latest = nextCapture;
         lastChangedAt = Date.now();
-        const nextText = clipOutput(latest.trim());
+        display = summarizeTmuxDisplay(this.target, latest, { mode: 'observe' });
+        emitToolSummaries(display.toolNames, emittedTools, emit);
+        const nextText = display.text;
         if (nextText && nextText !== emitted) {
           emitted = nextText;
           emit({ type: 'text_delta', text: emitted });
@@ -438,13 +468,42 @@ function isInputStillPending(capture: string, pendingText: string): boolean {
     .some((line) => line.trim() === `› ${firstLine}`);
 }
 
-function formatTmuxResult(
+function emitToolSummaries(
+  toolNames: string[],
+  emittedTools: Set<string>,
+  emit: (msg: StreamMessage) => void,
+): void {
+  for (const toolName of toolNames.slice(0, MAX_SUMMARY_TOOLS)) {
+    if (emittedTools.has(toolName)) continue;
+    emittedTools.add(toolName);
+    emit({ type: 'tool_use_start', toolName });
+    emit({ type: 'tool_use_end', toolName });
+  }
+}
+
+function summarizeTmuxDisplay(
+  target: string,
+  output: string,
+  opts: { mode: 'observe' | 'result'; inputText?: string },
+): TmuxDisplay {
+  const redactedOutput = redactTmuxOutput(output.trim());
+  const claudeSummary = summarizeClaudeTui(target, redactedOutput, opts);
+  if (claudeSummary) return claudeSummary;
+
+  if (opts.mode === 'observe') {
+    return formatGenericObservation(target, redactedOutput);
+  }
+
+  return formatGenericResult(target, opts.inputText ?? '', redactedOutput);
+}
+
+function formatGenericResult(
   target: string,
   inputText: string,
   output: string,
-): string {
+): TmuxDisplay {
   const input = redactTmuxOutput(normalizeTmuxInput(inputText).trim());
-  const result = clipResult(redactTmuxOutput(output.trim()));
+  const result = clipResult(output);
   const lines = [
     '**tmux 返回结果**',
     `目标：\`${target}\``,
@@ -454,7 +513,214 @@ function formatTmuxResult(
     result,
     '```',
   ];
-  return lines.filter((line, idx) => line || idx === 3).join('\n');
+  return {
+    text: lines.filter((line, idx) => line || idx === 3).join('\n'),
+    toolNames: [],
+  };
+}
+
+function formatGenericObservation(target: string, output: string): TmuxDisplay {
+  const clean = clipResult(stripTrailingComposer(output).trim());
+  const lines = [
+    '**tmux 接管状态**',
+    `目标：\`${target}\``,
+    '',
+    clean ? '```text' : '',
+    clean,
+    clean ? '```' : '当前 pane 没有可见输出。',
+  ];
+  return {
+    text: lines.filter(Boolean).join('\n'),
+    toolNames: [],
+  };
+}
+
+function summarizeClaudeTui(
+  target: string,
+  output: string,
+  opts: { mode: 'observe' | 'result'; inputText?: string },
+): TmuxDisplay | null {
+  if (!looksLikeClaudeTui(output)) return null;
+
+  const lines = output.split('\n');
+  const hud = extractClaudeHud(lines);
+  const toolNames = extractClaudeToolNames(lines, hud.toolCountLines);
+  const title = opts.mode === 'observe' ? '**tmux 接管状态**' : '**tmux 返回结果**';
+  const body: string[] = [title, `目标：\`${target}\``];
+
+  if (opts.mode === 'result' && opts.inputText) {
+    const input = normalizeTmuxInput(opts.inputText).trim();
+    if (input) body.push(`输入：\`${escapeInlineCode(redactTmuxOutput(input))}\``);
+  }
+
+  body.push('');
+  body.push('**Claude HUD**');
+  if (hud.prompt) body.push(`- 当前输入：\`${escapeInlineCode(hud.prompt)}\``);
+  for (const line of hud.summaryLines) {
+    body.push(`- ${line}`);
+  }
+  if (hud.summaryLines.length === 0 && !hud.prompt) {
+    body.push('- 未捕获到底部 HUD 摘要。');
+  }
+
+  if (toolNames.length > 0) {
+    body.push('');
+    body.push('**工具概览**');
+    for (const tool of toolNames.slice(0, MAX_SUMMARY_TOOLS)) {
+      body.push(`- ${tool}`);
+    }
+    if (toolNames.length > MAX_SUMMARY_TOOLS) {
+      body.push(`- 另有 ${toolNames.length - MAX_SUMMARY_TOOLS} 项工具调用已省略`);
+    }
+  }
+
+  body.push('');
+  body.push('> 已隐藏 Claude TUI 中的大段 Edit / diff 内容；执行中工具会通过临时进度卡展示。');
+
+  return {
+    text: body.join('\n'),
+    toolNames,
+  };
+}
+
+function looksLikeClaudeTui(output: string): boolean {
+  return (
+    /\[[^\]\n]*(?:Opus|Sonnet|Haiku|Claude)[^\]\n]*\]/i.test(output) ||
+    /\bUsage\b.*\bWeekly\b/s.test(output) ||
+    /⏵⏵\s+auto mode/i.test(output) ||
+    /(?:^|\n)\s*●\s+(?:Update|Bash|Read|Write|Edit|Search|Grep|Glob|Todo|Explore|Listed|Wrote)\b/.test(output)
+  );
+}
+
+function extractClaudeHud(lines: string[]): {
+  prompt: string;
+  summaryLines: string[];
+  toolCountLines: string[];
+} {
+  const prompt = findLastPrompt(lines);
+  const summaryLines: string[] = [];
+  const toolCountLines: string[] = [];
+  const tail = lines.slice(Math.max(0, lines.length - 40));
+
+  for (const rawLine of tail) {
+    const line = normalizeHudLine(rawLine);
+    if (!line) continue;
+
+    if (
+      /^\[[^\]]+\]/.test(line) ||
+      /\bgit:\([^)]+\)/.test(line) ||
+      /\|\s*\d+\s+hooks\b/.test(line) ||
+      /^Usage\b/i.test(line) ||
+      /^Weekly\b/i.test(line) ||
+      /^⏱/.test(line) ||
+      /auto mode/i.test(line) ||
+      /All todos complete/i.test(line)
+    ) {
+      summaryLines.push(line);
+      continue;
+    }
+
+    if (/^[✓✗]\s+/.test(line)) {
+      toolCountLines.push(line);
+      summaryLines.push(line);
+    }
+  }
+
+  return {
+    prompt,
+    summaryLines: uniqueStrings(summaryLines).slice(0, MAX_HUD_LINES),
+    toolCountLines,
+  };
+}
+
+function findLastPrompt(lines: string[]): string {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const match = lines[i].trim().match(/^[❯›]\s+(.+)$/);
+    if (match?.[1]) return match[1].trim();
+  }
+  return '';
+}
+
+function normalizeHudLine(line: string): string {
+  return line
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractClaudeToolNames(
+  lines: string[],
+  toolCountLines: string[],
+): string[] {
+  const countedNames: string[] = [];
+
+  for (const line of toolCountLines) {
+    const clean = normalizeHudLine(line).replace(/^[✓✗]\s+/, '');
+    for (const part of clean.split('|')) {
+      const token = part.trim().replace(/^[✓✗]\s+/, '');
+      if (token) countedNames.push(token);
+    }
+  }
+  if (countedNames.length > 0) {
+    return uniqueStrings(countedNames).slice(0, MAX_SUMMARY_TOOLS * 2);
+  }
+
+  const names: string[] = [];
+  for (const rawLine of lines) {
+    const line = normalizeHudLine(rawLine);
+    const bullet = line.match(/^●\s+([A-Za-z][\w:-]*)(?:\(([^)]*)\)|:|\b)/);
+    if (!bullet) continue;
+    if (!isKnownClaudeToolHeader(bullet[1])) continue;
+    names.push(normalizeClaudeToolName(bullet[1], bullet[2]));
+  }
+
+  return uniqueStrings(names.filter(Boolean)).slice(0, MAX_SUMMARY_TOOLS * 2);
+}
+
+function isKnownClaudeToolHeader(name: string): boolean {
+  return new Set([
+    'Bash',
+    'Edit',
+    'Glob',
+    'Grep',
+    'LS',
+    'List',
+    'Listed',
+    'Read',
+    'Search',
+    'Todo',
+    'TodoWrite',
+    'Update',
+    'Write',
+    'Wrote',
+  ]).has(name);
+}
+
+function normalizeClaudeToolName(name: string, arg?: string): string {
+  const mapped =
+    name === 'Update'
+      ? 'Edit'
+      : name === 'Wrote'
+        ? 'Write'
+        : name === 'Listed' || name === 'List'
+          ? 'LS'
+          : name;
+  if (!arg) return mapped;
+
+  const path = arg.split(',')[0]?.trim();
+  if (!path || mapped === 'Bash') return mapped;
+  return `${mapped} ${path}`;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
 }
 
 function extractTurnOutput(before: string, after: string, inputText: string): string {
